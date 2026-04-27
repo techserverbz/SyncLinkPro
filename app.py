@@ -297,8 +297,28 @@ def on_shutdown():
     scheduler.shutdown(wait=False)
 
 
+def kill_existing_port(port: int):
+    """Kill any process already using this port."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano"], capture_output=True, text=True
+        )
+        for line in result.stdout.splitlines():
+            if f":{port}" in line and "LISTENING" in line:
+                pid = line.strip().split()[-1]
+                subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True)
+                print(f"  Killed existing process on port {port} (PID {pid})")
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    port = 7878
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
+    port = int(os.getenv("PORT", 7878))
+    kill_existing_port(port)
     url = f"http://localhost:{port}"
     print(f"\n  SyncLinkPro  →  {url}\n")
     try:
