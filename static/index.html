@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>SyncLinkPro</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-dot"></span>
+        <span class="brand-name">SyncLinkPro</span>
+      </div>
+      <button id="btn-new" class="op-btn op-btn-primary">＋ NEW PAIR</button>
+      <div class="eyebrow">SYNC PAIRS</div>
+      <ul id="pair-list" class="pair-list"></ul>
+      <div class="sidebar-foot">
+        <span id="ws-dot" class="live-dot off"></span>
+        <span id="ws-label">CONNECTING…</span>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div id="empty-state" class="empty">
+        <div class="empty-title">No pair selected</div>
+        <div class="empty-sub">Create a sync pair to begin.</div>
+      </div>
+
+      <section id="detail" class="detail hidden">
+        <header class="detail-head">
+          <div class="detail-title">
+            <h1 id="d-name">—</h1>
+            <span id="d-status" class="status-chip">IDLE</span>
+          </div>
+          <div class="detail-actions">
+            <button id="btn-sync-now" class="op-btn">SYNC NOW</button>
+            <button id="btn-pause" class="op-btn">PAUSE</button>
+            <button id="btn-edit" class="op-btn">EDIT</button>
+            <button id="btn-delete" class="op-btn op-btn-danger">REMOVE</button>
+          </div>
+        </header>
+
+        <div class="info-grid">
+          <div><span class="label">FOLDER A</span><span id="d-a" class="value mono">—</span></div>
+          <div><span class="label">FOLDER B</span><span id="d-b" class="value mono">—</span></div>
+          <div><span class="label">MODE</span><span id="d-mode" class="value">—</span></div>
+          <div><span class="label">TRIGGER</span><span id="d-trigger" class="value">—</span></div>
+          <div><span class="label">DELETE ORPHANS</span><span id="d-orphans" class="value">—</span></div>
+          <div><span class="label">LAST SYNC</span><span id="d-last" class="value mono">Never</span></div>
+          <div class="full"><span class="label">IGNORED</span><span id="d-ignore" class="value mono">—</span></div>
+        </div>
+
+        <div id="progress-wrap" class="progress-wrap hidden">
+          <div class="progress-head">
+            <span id="progress-phase" class="eyebrow">SCANNING…</span>
+            <span id="progress-pct" class="progress-pct mono">0%</span>
+          </div>
+          <div class="progress-track"><div id="progress-fill" class="progress-fill"></div></div>
+        </div>
+
+        <div class="logs-head">
+          <div class="eyebrow">ACTIVITY</div>
+          <div class="log-filters">
+            <button class="chip chip-active" data-filter="all">ALL</button>
+            <button class="chip" data-filter="info">INFO</button>
+            <button class="chip" data-filter="warn">WARN</button>
+            <button class="chip" data-filter="error">ERROR</button>
+          </div>
+        </div>
+        <ul id="logs" class="logs"></ul>
+      </section>
+    </main>
+  </div>
+
+  <!-- modal -->
+  <div id="modal" class="modal-backdrop hidden">
+    <div class="modal">
+      <div class="modal-head">
+        <h2 id="modal-title">NEW SYNC PAIR</h2>
+        <button class="modal-close" id="modal-close">✕</button>
+      </div>
+      <div class="modal-body">
+        <label>NAME
+          <input id="f-name" type="text" placeholder="e.g. Drive ↔ Desktop" />
+        </label>
+        <label>FOLDER A
+          <div class="path-row">
+            <input id="f-a" type="text" placeholder="C:/path/to/folder" />
+            <button class="op-btn op-btn-sm" id="pick-a">PICK</button>
+          </div>
+        </label>
+        <label>FOLDER B
+          <div class="path-row">
+            <input id="f-b" type="text" placeholder="H:/My Drive/..." />
+            <button class="op-btn op-btn-sm" id="pick-b">PICK</button>
+          </div>
+        </label>
+        <div class="row-2">
+          <label>MODE
+            <select id="f-mode">
+              <option value="twoway">TWO-WAY</option>
+              <option value="oneway">ONE-WAY (A → B)</option>
+            </select>
+          </label>
+          <label>TRIGGER
+            <select id="f-trigger">
+              <option value="auto">AUTO (LIVE)</option>
+              <option value="manual">MANUAL</option>
+              <option value="scheduled">SCHEDULED</option>
+            </select>
+          </label>
+        </div>
+        <label id="schedule-label" class="hidden">CRON
+          <input id="f-schedule" type="text" placeholder="*/15 * * * *" />
+          <small class="hint">Presets: <a href="#" data-cron="*/5 * * * *">5m</a> · <a href="#" data-cron="*/15 * * * *">15m</a> · <a href="#" data-cron="0 * * * *">hourly</a> · <a href="#" data-cron="0 9 * * 1-5">weekdays 9am</a></small>
+        </label>
+        <label>IGNORE DIRS <small class="hint">comma-separated</small>
+          <input id="f-idirs" type="text" placeholder=".git, node_modules, .next" />
+        </label>
+        <label>IGNORE PATTERNS <small class="hint">comma-separated, glob-style</small>
+          <input id="f-ipat" type="text" placeholder="*.log, *.tmp" />
+        </label>
+        <label>SAFETY SCAN INTERVAL <small class="hint">seconds — how often to do a full-folder check. Empty = default (5s two-way, 30s one-way)</small>
+          <input id="f-safety" type="number" min="1" placeholder="5" />
+        </label>
+        <label class="checkbox">
+          <input id="f-orphans" type="checkbox" checked />
+          <span>Delete orphans (remove files in one folder when missing in the other)</span>
+        </label>
+      </div>
+      <div class="modal-foot">
+        <button class="op-btn" id="modal-cancel">CANCEL</button>
+        <button class="op-btn op-btn-primary" id="modal-save">SAVE</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- folder picker modal -->
+  <div id="picker" class="modal-backdrop hidden">
+    <div class="modal picker-modal">
+      <div class="modal-head">
+        <h2>PICK FOLDER</h2>
+        <button class="modal-close" id="picker-close">✕</button>
+      </div>
+      <div class="picker-path mono" id="picker-path">—</div>
+      <ul id="picker-list" class="picker-list"></ul>
+      <div class="modal-foot">
+        <button class="op-btn" id="picker-cancel">CANCEL</button>
+        <button class="op-btn op-btn-primary" id="picker-confirm">SELECT THIS FOLDER</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

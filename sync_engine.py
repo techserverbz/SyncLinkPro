@@ -1,0 +1,667 @@
+"""
+SyncLinkPro — sync engine.
+Port of Initial Auto Sync's logic with:
+  - State files stored in Documents/autosync/state/ (never in source or destination)
+  - Callback-based event emission for web UI
+  - Pause/resume support
+  - Both one-way and two-way modes under one engine
+"""
+from __future__ import annotations
+import os
+import time
+import json
+import shutil
+import hashlib
+import threading
+import fnmatch
+from pathlib import Path
+from datetime import datetime
+from dataclasses import dataclass, field, asdict
+from typing import Callable, Optional
+
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+STATE_ROOT = Path(os.path.expanduser("~")) / "Documents" / "autosync" / "state"
+(STATE_ROOT / "sync-state").mkdir(parents=True, exist_ok=True)
+(STATE_ROOT / "logs").mkdir(parents=True, exist_ok=True)
+
+DEBOUNCE_SECONDS = 2.0
+DEBOUNCE_SECONDS_1WAY = 0.5
+SAFETY_SCAN_TWOWAY = 5
+SAFETY_SCAN_ONEWAY = 30
+DELETE_MAX_RETRIES = 30
+DELETE_INITIAL_DELAY = 2.0
+SUPPRESS_TTL = 5.0
+
+DEFAULT_IGNORE_FILES = {
+    "desktop.ini", "thumbs.db", ".ds_store",
+}
+DEFAULT_IGNORE_PATTERNS = ("~$*", "*.tmp", "*.temp", "*.swp", "*.lock")
+DEFAULT_IGNORE_DIRS = {
+    ".git", "__pycache__", "node_modules", ".next",
+    ".sync-metadata", "dist", ".venv", "venv",
+}
+
+
+def md5_of(path: Path, block: int = 65536) -> Optional[str]:
+    try:
+        h = hashlib.md5()
+        with path.open("rb") as f:
+            while chunk := f.read(block):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def should_ignore(name: str, extra_files: set[str], extra_patterns: tuple[str, ...]) -> bool:
+    low = name.lower()
+    if low in DEFAULT_IGNORE_FILES or low in extra_files:
+        return True
+    for pat in DEFAULT_IGNORE_PATTERNS + extra_patterns:
+        if fnmatch.fnmatch(low, pat.lower()):
+            return True
+    return False
+
+
+def should_ignore_dir(name: str, extra_dirs: set[str]) -> bool:
+    return name in DEFAULT_IGNORE_DIRS or name in extra_dirs
+
+
+class SyncState:
+    """Per-pair state: relpath -> {mtime, size, source, updated}."""
+    def __init__(self, pair_id: str):
+        self.path = STATE_ROOT / "sync-state" / f"{pair_id}.json"
+        self.data: dict = {}
+        self._lock = threading.Lock()
+        self._load()
+
+    def _load(self):
+        if self.path.exists():
+            try:
+                self.data = json.loads(self.path.read_text(encoding="utf-8"))
+            except Exception:
+                self.data = {}
+
+    def save(self):
+        with self._lock:
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
+            tmp.replace(self.path)
+
+    def record(self, relpath: str, mtime: float, size: int, source: str):
+        self.data[relpath] = {
+            "mtime": mtime, "size": size, "source": source,
+            "updated": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    def forget(self, relpath: str):
+        self.data.pop(relpath, None)
+
+    def was_known(self, relpath: str) -> bool:
+        return relpath in self.data
+
+
+class SuppressSet:
+    """Track paths recently written/deleted by the engine to ignore watcher echoes."""
+    def __init__(self, ttl: float = SUPPRESS_TTL):
+        self.ttl = ttl
+        self._entries: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def add(self, path: str):
+        with self._lock:
+            self._entries[path] = time.time()
+
+    def contains(self, path: str) -> bool:
+        now = time.time()
+        with self._lock:
+            self._entries = {k: v for k, v in self._entries.items() if now - v < self.ttl}
+            return path in self._entries
+
+
+class DeleteQueue:
+    """Retries deletes that fail because of Google Drive / cloud locks."""
+    def __init__(self, logger: Callable[[str, str], None]):
+        self.queue: list[tuple[Path, float, int]] = []
+        self._lock = threading.Lock()
+        self.logger = logger
+
+    def attempt_delete(self, target: Path) -> bool:
+        try:
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            elif target.exists():
+                target.unlink()
+            return True
+        except Exception as e:
+            self.logger("warn", f"Delete failed (queuing retry): {target} — {e}")
+            with self._lock:
+                self.queue.append((target, time.time() + DELETE_INITIAL_DELAY, 0))
+            return False
+
+    def tick(self):
+        if not self.queue:
+            return
+        now = time.time()
+        pending = []
+        with self._lock:
+            for target, when, tries in self.queue:
+                if now < when:
+                    pending.append((target, when, tries))
+                    continue
+                try:
+                    if target.is_dir() and not target.is_symlink():
+                        shutil.rmtree(target)
+                    elif target.exists():
+                        target.unlink()
+                    self.logger("info", f"Delete succeeded on retry: {target}")
+                except Exception as e:
+                    tries += 1
+                    if tries >= DELETE_MAX_RETRIES:
+                        self.logger("error", f"Delete abandoned after {tries} tries: {target} — {e}")
+                    else:
+                        delay = DELETE_INITIAL_DELAY * min(tries, 4)
+                        pending.append((target, now + delay, tries))
+            self.queue = pending
+
+
+@dataclass
+class SyncPairConfig:
+    id: str
+    name: str
+    folder_a: str
+    folder_b: str
+    mode: str = "twoway"  # twoway | oneway
+    trigger: str = "auto"  # manual | auto | scheduled
+    schedule: Optional[str] = None  # cron expression
+    ignore_dirs: list = field(default_factory=list)
+    ignore_files: list = field(default_factory=list)
+    ignore_patterns: list = field(default_factory=list)
+    delete_orphans: bool = True
+    safety_scan_interval: Optional[int] = None  # seconds; None = use default (5 for twoway, 30 for oneway)
+    paused: bool = False
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    last_sync: Optional[str] = None
+
+
+class PairRuntime:
+    """A single sync pair. Handles watchers + full scans + state."""
+    def __init__(self, cfg: SyncPairConfig, emit: Callable[[str, str, str, dict], None]):
+        self.cfg = cfg
+        self.emit = emit  # (pair_id, level, message, extra) callback
+        self.state = SyncState(cfg.id)
+        self.suppress = SuppressSet()
+        self.delete_q = DeleteQueue(lambda lvl, msg: self._log(lvl, msg))
+        self._scan_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._observer: Optional[Observer] = None
+        self._scan_thread: Optional[threading.Thread] = None
+        self._pending_events: dict[str, tuple[str, float]] = {}  # relpath -> (kind, ts)
+        self._events_lock = threading.Lock()
+        self._debounce_thread: Optional[threading.Thread] = None
+        self.status = "idle"  # idle | syncing | error | paused
+
+    # ---- logging helpers ----
+    def _log(self, level: str, message: str, extra: Optional[dict] = None):
+        self.emit(self.cfg.id, level, message, extra or {})
+
+    def _set_status(self, s: str):
+        self.status = s
+        self.emit(self.cfg.id, "status", s, {})
+
+    def _progress(self, phase: str, percent: int, current: int = 0, total: int = 0):
+        self.emit(self.cfg.id, "progress", phase, {"percent": percent, "current": current, "total": total})
+
+    # ---- ignore helpers ----
+    def _ignore_file(self, name: str) -> bool:
+        return should_ignore(name, set(self.cfg.ignore_files), tuple(self.cfg.ignore_patterns))
+
+    def _ignore_dir(self, name: str) -> bool:
+        return should_ignore_dir(name, set(self.cfg.ignore_dirs))
+
+    # ---- scan ----
+    def _walk(self, root: Path) -> dict[str, dict]:
+        out: dict[str, dict] = {}
+        if not root.exists():
+            return out
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not self._ignore_dir(d)]
+            rel_dir = Path(dirpath).relative_to(root).as_posix()
+            for fname in filenames:
+                if self._ignore_file(fname):
+                    continue
+                full = Path(dirpath) / fname
+                rel = (Path(rel_dir) / fname).as_posix() if rel_dir != "." else fname
+                try:
+                    st = full.stat()
+                    out[rel] = {"mtime": st.st_mtime, "size": st.st_size, "is_dir": False}
+                except Exception:
+                    continue
+            # track empty dirs
+            if not filenames and not dirnames and rel_dir != ".":
+                out[rel_dir + "/"] = {"mtime": 0, "size": -1, "is_dir": True}
+        return out
+
+    # ---- copy / delete ----
+    def _copy(self, src: Path, dst: Path):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_dir():
+            dst.mkdir(parents=True, exist_ok=True)
+        else:
+            shutil.copy2(src, dst)
+        self.suppress.add(str(dst))
+
+    def _delete(self, target: Path) -> bool:
+        self.suppress.add(str(target))
+        return self.delete_q.attempt_delete(target)
+
+    # ---- full scan (both modes) ----
+    def full_sync(self, reason: str = "manual"):
+        if self.cfg.paused:
+            self._log("warn", f"Skipping sync — pair is paused (reason: {reason})")
+            return
+        if not self._scan_lock.acquire(blocking=False):
+            self._log("warn", f"Scan already running; ignoring trigger: {reason}")
+            return
+        try:
+            self._set_status("syncing")
+            self._log("info", f"Full sync started ({reason})")
+            a = Path(self.cfg.folder_a)
+            b = Path(self.cfg.folder_b)
+            if not a.exists():
+                self._log("error", f"Folder A missing: {a}")
+                self._set_status("error")
+                return
+            if self.cfg.mode == "twoway" and not b.exists():
+                b.mkdir(parents=True, exist_ok=True)
+                self._log("info", f"Created destination: {b}")
+            elif self.cfg.mode == "oneway" and not b.exists():
+                b.mkdir(parents=True, exist_ok=True)
+
+            self._progress("Scanning folder A", 5)
+            map_a = self._walk(a)
+            self._progress("Scanning folder B", 25)
+            map_b = self._walk(b)
+            all_paths = sorted(set(map_a) | set(map_b))
+            total = len(all_paths)
+            self._progress(f"Comparing {total} files", 40, 0, total)
+            copies = dels = skips = errs = 0
+            for idx, rel in enumerate(all_paths):
+                if idx and total and idx % max(50, total // 40) == 0:
+                    pct = 40 + int((idx / total) * 55) if total else 95
+                    self._progress(f"Syncing ({idx}/{total})", pct, idx, total)
+                try:
+                    in_a = rel in map_a
+                    in_b = rel in map_b
+                    src_path_a = a / rel
+                    src_path_b = b / rel
+                    # Handle directory markers
+                    if rel.endswith("/"):
+                        actual_rel = rel.rstrip("/")
+                        pa = a / actual_rel
+                        pb = b / actual_rel
+                        if in_a and not in_b:
+                            pb.mkdir(parents=True, exist_ok=True)
+                            copies += 1
+                            self.state.record(rel, 0, -1, "a")
+                        elif in_b and not in_a and self.cfg.mode == "twoway":
+                            pa.mkdir(parents=True, exist_ok=True)
+                            copies += 1
+                            self.state.record(rel, 0, -1, "b")
+                        continue
+
+                    if in_a and not in_b:
+                        # present only in A
+                        if self.cfg.mode == "twoway":
+                            if self.state.was_known(rel):
+                                # was synced before, now gone from B → delete from A
+                                if self.cfg.delete_orphans:
+                                    self._delete(src_path_a)
+                                    self.state.forget(rel)
+                                    dels += 1
+                                    continue
+                            self._copy(src_path_a, src_path_b)
+                            self.state.record(rel, map_a[rel]["mtime"], map_a[rel]["size"], "a")
+                            copies += 1
+                        else:  # oneway: A is source → copy to B
+                            self._copy(src_path_a, src_path_b)
+                            self.state.record(rel, map_a[rel]["mtime"], map_a[rel]["size"], "a")
+                            copies += 1
+                    elif in_b and not in_a:
+                        if self.cfg.mode == "twoway":
+                            if self.state.was_known(rel):
+                                if self.cfg.delete_orphans:
+                                    self._delete(src_path_b)
+                                    self.state.forget(rel)
+                                    dels += 1
+                                    continue
+                            self._copy(src_path_b, src_path_a)
+                            self.state.record(rel, map_b[rel]["mtime"], map_b[rel]["size"], "b")
+                            copies += 1
+                        else:  # oneway: B is mirror, missing in A → delete from B
+                            if self.cfg.delete_orphans:
+                                self._delete(src_path_b)
+                                self.state.forget(rel)
+                                dels += 1
+                    else:  # in both — compare
+                        ma = map_a[rel]["mtime"]
+                        mb = map_b[rel]["mtime"]
+                        sa = map_a[rel]["size"]
+                        sb = map_b[rel]["size"]
+                        if sa == sb and abs(ma - mb) < 1.0:
+                            skips += 1
+                            continue
+                        if sa == sb:
+                            # same size, different mtime → verify with hash
+                            ha = md5_of(src_path_a)
+                            hb = md5_of(src_path_b)
+                            if ha and hb and ha == hb:
+                                # content identical — touch state, skip copy
+                                newer_mtime = max(ma, mb)
+                                self.state.record(rel, newer_mtime, sa, "both")
+                                skips += 1
+                                continue
+                        # copy newer → older
+                        if self.cfg.mode == "oneway" or ma >= mb:
+                            self._copy(src_path_a, src_path_b)
+                            self.state.record(rel, ma, sa, "a")
+                        else:
+                            self._copy(src_path_b, src_path_a)
+                            self.state.record(rel, mb, sb, "b")
+                        copies += 1
+                except Exception as e:
+                    errs += 1
+                    self._log("error", f"Sync error for {rel}: {e}")
+            self.state.save()
+            self.cfg.last_sync = datetime.now().isoformat(timespec="seconds")
+            self._progress("Done", 100, total, total)
+            self._log("info", f"Full sync done — copied: {copies}, deleted: {dels}, skipped: {skips}, errors: {errs}")
+            self._set_status("idle" if errs == 0 else "error")
+        finally:
+            self._scan_lock.release()
+
+    # ---- event-driven sync ----
+    def _queue_event(self, relpath: str, kind: str):
+        with self._events_lock:
+            self._pending_events[relpath] = (kind, time.time())
+
+    def _debounce_loop(self, stop_event):
+        interval = DEBOUNCE_SECONDS if self.cfg.mode == "twoway" else DEBOUNCE_SECONDS_1WAY
+        while not stop_event.is_set():
+            time.sleep(0.25)
+            now = time.time()
+            due: list[tuple[str, str]] = []
+            with self._events_lock:
+                for rel, (kind, ts) in list(self._pending_events.items()):
+                    if now - ts >= interval:
+                        due.append((rel, kind))
+                        self._pending_events.pop(rel, None)
+            for rel, kind in due:
+                try:
+                    self._handle_single_event(rel, kind)
+                except Exception as e:
+                    self._log("error", f"Live sync error ({rel}): {e}")
+            self.delete_q.tick()
+
+    def _handle_single_event(self, rel: str, kind: str):
+        if self.cfg.paused:
+            return
+        a = Path(self.cfg.folder_a)
+        b = Path(self.cfg.folder_b)
+        src_a = a / rel
+        src_b = b / rel
+        a_exists = src_a.exists()
+        b_exists = src_b.exists()
+        if self.cfg.mode == "twoway":
+            # Whichever side exists or is newer wins
+            if not a_exists and not b_exists:
+                if self.state.was_known(rel):
+                    self.state.forget(rel)
+                    self.state.save()
+                return
+            if a_exists and not b_exists:
+                if self.state.was_known(rel) and self.cfg.delete_orphans:
+                    self._delete(src_a)
+                    self.state.forget(rel)
+                else:
+                    self._copy(src_a, src_b)
+                    try:
+                        st = src_a.stat()
+                        self.state.record(rel, st.st_mtime, st.st_size, "a")
+                    except Exception:
+                        pass
+            elif b_exists and not a_exists:
+                if self.state.was_known(rel) and self.cfg.delete_orphans:
+                    self._delete(src_b)
+                    self.state.forget(rel)
+                else:
+                    self._copy(src_b, src_a)
+                    try:
+                        st = src_b.stat()
+                        self.state.record(rel, st.st_mtime, st.st_size, "b")
+                    except Exception:
+                        pass
+            else:
+                try:
+                    sa = src_a.stat()
+                    sb = src_b.stat()
+                    if sa.st_size == sb.st_size and abs(sa.st_mtime - sb.st_mtime) < 1.0:
+                        return
+                    if sa.st_size == sb.st_size:
+                        ha, hb = md5_of(src_a), md5_of(src_b)
+                        if ha and hb and ha == hb:
+                            return
+                    if sa.st_mtime >= sb.st_mtime:
+                        self._copy(src_a, src_b)
+                        self.state.record(rel, sa.st_mtime, sa.st_size, "a")
+                    else:
+                        self._copy(src_b, src_a)
+                        self.state.record(rel, sb.st_mtime, sb.st_size, "b")
+                except Exception as e:
+                    self._log("error", f"Compare error {rel}: {e}")
+        else:  # oneway: A → B
+            if a_exists:
+                self._copy(src_a, src_b)
+                try:
+                    st = src_a.stat()
+                    self.state.record(rel, st.st_mtime, st.st_size, "a")
+                except Exception:
+                    pass
+            else:
+                if self.cfg.delete_orphans and b_exists:
+                    self._delete(src_b)
+                    self.state.forget(rel)
+        self.state.save()
+        self.cfg.last_sync = datetime.now().isoformat(timespec="seconds")
+
+    # ---- watchdog handlers ----
+    def _make_handler(self, root: Path):
+        pair = self
+        class H(FileSystemEventHandler):
+            def _rel(self, p: str) -> Optional[str]:
+                try:
+                    rp = Path(p).relative_to(root).as_posix()
+                except Exception:
+                    return None
+                if not rp or rp == ".":
+                    return None
+                # drop ignored
+                parts = rp.split("/")
+                if any(pair._ignore_dir(x) for x in parts[:-1]):
+                    return None
+                if pair._ignore_file(parts[-1]):
+                    return None
+                return rp
+
+            def on_any_event(self, event):
+                if event.is_directory:
+                    return  # directories handled via file events or full scan
+                if pair.suppress.contains(event.src_path):
+                    return
+                rel = self._rel(event.src_path)
+                if rel is None:
+                    return
+                pair._queue_event(rel, event.event_type)
+        return H()
+
+    # ---- safety scan ----
+    def _safety_scan_loop(self, stop_event):
+        default_interval = SAFETY_SCAN_TWOWAY if self.cfg.mode == "twoway" else SAFETY_SCAN_ONEWAY
+        interval = self.cfg.safety_scan_interval if self.cfg.safety_scan_interval and self.cfg.safety_scan_interval > 0 else default_interval
+        while not stop_event.is_set():
+            # chunk the sleep so we respond to stop quickly
+            for _ in range(interval):
+                if stop_event.is_set():
+                    return
+                time.sleep(1)
+            if self.cfg.paused:
+                continue
+            # quiet full scan — no noisy log unless changes
+            try:
+                self.full_sync(reason="safety-scan")
+            except Exception as e:
+                self._log("error", f"Safety scan error: {e}")
+
+    # ---- lifecycle ----
+    def start(self):
+        if self.cfg.trigger != "auto":
+            self._log("info", f"Pair configured for {self.cfg.trigger} trigger — watcher NOT started.")
+            return
+        if self._observer is not None:
+            return
+        self._stop = threading.Event()  # fresh event for this run
+        stop_event = self._stop  # capture by closure — old threads kept ref to the OLD (set) event
+        self._observer = Observer()
+        self._observer.schedule(self._make_handler(Path(self.cfg.folder_a)), self.cfg.folder_a, recursive=True)
+        if self.cfg.mode == "twoway":
+            self._observer.schedule(self._make_handler(Path(self.cfg.folder_b)), self.cfg.folder_b, recursive=True)
+        self._observer.start()
+        self._debounce_thread = threading.Thread(target=self._debounce_loop, args=(stop_event,), daemon=True)
+        self._debounce_thread.start()
+        self._scan_thread = threading.Thread(target=self._safety_scan_loop, args=(stop_event,), daemon=True)
+        self._scan_thread.start()
+        self._log("info", f"Live watcher started ({self.cfg.mode}).")
+
+    def stop(self):
+        self._stop.set()
+        if self._observer:
+            self._observer.stop()
+            try:
+                self._observer.join(timeout=2)
+            except Exception:
+                pass
+            self._observer = None
+        self._log("info", "Pair stopped.")
+
+    def to_dict(self) -> dict:
+        d = asdict(self.cfg)
+        d["status"] = self.status
+        return d
+
+
+# ------------- Engine manager + persistence -------------
+PAIRS_FILE = STATE_ROOT / "pairs.json"
+
+
+class Engine:
+    def __init__(self, emit: Callable[[str, str, str, dict], None]):
+        self.emit = emit
+        self.pairs: dict[str, PairRuntime] = {}
+        self._logs: dict[str, list] = {}  # pair_id -> list (capped)
+        self._logs_lock = threading.Lock()
+        self.load_pairs()
+
+    def load_pairs(self):
+        if not PAIRS_FILE.exists():
+            return
+        try:
+            raw = json.loads(PAIRS_FILE.read_text(encoding="utf-8"))
+            for cfg_dict in raw:
+                cfg = SyncPairConfig(**cfg_dict)
+                pair = PairRuntime(cfg, self.emit)
+                self.pairs[cfg.id] = pair
+                if cfg.trigger == "auto" and not cfg.paused:
+                    pair.start()
+        except Exception as e:
+            print(f"[engine] failed to load pairs: {e}")
+
+    def save_pairs(self):
+        data = [asdict(p.cfg) for p in self.pairs.values()]
+        tmp = PAIRS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp.replace(PAIRS_FILE)
+
+    def add_pair(self, cfg: SyncPairConfig) -> PairRuntime:
+        self.pairs[cfg.id] = PairRuntime(cfg, self.emit)
+        self.save_pairs()
+        if cfg.trigger == "auto" and not cfg.paused:
+            self.pairs[cfg.id].start()
+        return self.pairs[cfg.id]
+
+    def remove_pair(self, pid: str):
+        p = self.pairs.pop(pid, None)
+        if p:
+            p.stop()
+        self.save_pairs()
+
+    def update_pair(self, pid: str, patch: dict):
+        p = self.pairs.get(pid)
+        if not p:
+            return None
+        p.stop()
+        cfg_dict = asdict(p.cfg)
+        cfg_dict.update(patch)
+        new_cfg = SyncPairConfig(**cfg_dict)
+        p.cfg = new_cfg
+        if new_cfg.trigger == "auto" and not new_cfg.paused:
+            p.start()
+        self.save_pairs()
+        return p
+
+    def pause(self, pid: str):
+        p = self.pairs.get(pid)
+        if not p:
+            return None
+        p.cfg.paused = True
+        p.stop()
+        self.save_pairs()
+        return p
+
+    def resume(self, pid: str):
+        p = self.pairs.get(pid)
+        if not p:
+            return None
+        p.cfg.paused = False
+        if p.cfg.trigger == "auto":
+            p.start()
+        self.save_pairs()
+        return p
+
+    def manual_sync(self, pid: str):
+        p = self.pairs.get(pid)
+        if not p:
+            return None
+        threading.Thread(target=p.full_sync, args=("manual",), daemon=True).start()
+        return p
+
+    def append_log(self, pid: str, level: str, message: str, extra: dict):
+        with self._logs_lock:
+            lst = self._logs.setdefault(pid, [])
+            lst.append({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "level": level,
+                "message": message,
+                **(extra or {}),
+            })
+            if len(lst) > 1000:
+                del lst[: len(lst) - 1000]
+
+    def get_logs(self, pid: str, limit: int = 200) -> list:
+        with self._logs_lock:
+            return list(self._logs.get(pid, []))[-limit:]
+
+    def stop_all(self):
+        for p in self.pairs.values():
+            p.stop()
