@@ -34,6 +34,13 @@ DELETE_MAX_RETRIES = 30
 DELETE_INITIAL_DELAY = 2.0
 SUPPRESS_TTL = 5.0
 
+# Safety net against catastrophic mass-deletes (e.g. a cloud drive going
+# offline / reading empty). An AUTOMATIC full scan refuses to propagate deletes
+# when too many previously-synced files would vanish at once. A manual "Sync
+# now" is treated as an explicit, trusted action and is never blocked.
+DELETE_SAFETY_MIN = 25          # block an auto scan deleting at least this many files
+DELETE_SAFETY_WHOLE_MIN = 5     # ...or this many when a whole side reads empty
+
 DEFAULT_IGNORE_FILES = {
     "desktop.ini", "thumbs.db", ".ds_store",
 }
@@ -85,22 +92,36 @@ class SyncState:
                 self.data = {}
 
     def save(self):
+        # Snapshot under the lock so we never serialize a dict that another
+        # thread (safety scan vs. live watcher) is mutating mid-write.
         with self._lock:
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
-            tmp.replace(self.path)
+            payload = json.dumps(self.data, indent=2)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(self.path)
 
     def record(self, relpath: str, mtime: float, size: int, source: str):
-        self.data[relpath] = {
-            "mtime": mtime, "size": size, "source": source,
-            "updated": datetime.now().isoformat(timespec="seconds"),
-        }
+        with self._lock:
+            self.data[relpath] = {
+                "mtime": mtime, "size": size, "source": source,
+                "updated": datetime.now().isoformat(timespec="seconds"),
+            }
 
     def forget(self, relpath: str):
-        self.data.pop(relpath, None)
+        with self._lock:
+            self.data.pop(relpath, None)
 
     def was_known(self, relpath: str) -> bool:
-        return relpath in self.data
+        with self._lock:
+            return relpath in self.data
+
+    def known_count(self) -> int:
+        with self._lock:
+            return len(self.data)
+
+    def known_keys(self) -> list[str]:
+        with self._lock:
+            return list(self.data.keys())
 
 
 class SuppressSet:
@@ -122,23 +143,34 @@ class SuppressSet:
 
 
 class DeleteQueue:
-    """Retries deletes that fail because of Google Drive / cloud locks."""
+    """Retries deletes that fail because of Google Drive / cloud locks.
+
+    Each queued delete carries an optional ``on_done(success: bool)`` callback so
+    the owner can forget sync-state only once the delete *actually* completes
+    (and re-enable normal handling if it is ultimately abandoned).
+    """
     def __init__(self, logger: Callable[[str, str], None]):
-        self.queue: list[tuple[Path, float, int]] = []
+        self.queue: list[tuple[Path, float, int, Optional[Callable[[bool], None]]]] = []
         self._lock = threading.Lock()
         self.logger = logger
 
-    def attempt_delete(self, target: Path) -> bool:
+    @staticmethod
+    def _remove(target: Path):
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
+        elif target.exists():
+            target.unlink()
+
+    def attempt_delete(self, target: Path, on_done: Optional[Callable[[bool], None]] = None) -> bool:
+        """Try once. Returns True on immediate success (caller handles cleanup);
+        on failure the delete is queued and ``on_done`` fires later from tick()."""
         try:
-            if target.is_dir() and not target.is_symlink():
-                shutil.rmtree(target)
-            elif target.exists():
-                target.unlink()
+            self._remove(target)
             return True
         except Exception as e:
             self.logger("warn", f"Delete failed (queuing retry): {target} — {e}")
             with self._lock:
-                self.queue.append((target, time.time() + DELETE_INITIAL_DELAY, 0))
+                self.queue.append((target, time.time() + DELETE_INITIAL_DELAY, 0, on_done))
             return False
 
     def tick(self):
@@ -146,25 +178,33 @@ class DeleteQueue:
             return
         now = time.time()
         pending = []
+        callbacks: list[tuple[Callable[[bool], None], bool]] = []
         with self._lock:
-            for target, when, tries in self.queue:
+            for target, when, tries, on_done in self.queue:
                 if now < when:
-                    pending.append((target, when, tries))
+                    pending.append((target, when, tries, on_done))
                     continue
                 try:
-                    if target.is_dir() and not target.is_symlink():
-                        shutil.rmtree(target)
-                    elif target.exists():
-                        target.unlink()
+                    self._remove(target)
                     self.logger("info", f"Delete succeeded on retry: {target}")
+                    if on_done:
+                        callbacks.append((on_done, True))
                 except Exception as e:
                     tries += 1
                     if tries >= DELETE_MAX_RETRIES:
                         self.logger("error", f"Delete abandoned after {tries} tries: {target} — {e}")
+                        if on_done:
+                            callbacks.append((on_done, False))
                     else:
                         delay = DELETE_INITIAL_DELAY * min(tries, 4)
-                        pending.append((target, now + delay, tries))
+                        pending.append((target, now + delay, tries, on_done))
             self.queue = pending
+        # Fire callbacks outside the lock to avoid any re-entrancy surprises.
+        for cb, ok in callbacks:
+            try:
+                cb(ok)
+            except Exception:
+                pass
 
 
 @dataclass
@@ -194,6 +234,9 @@ class PairRuntime:
         self.state = SyncState(cfg.id)
         self.suppress = SuppressSet()
         self.delete_q = DeleteQueue(lambda lvl, msg: self._log(lvl, msg))
+        # relpaths whose delete is currently queued/retrying — never re-create
+        # or re-queue these while a delete is in flight.
+        self._pending_delete: set[str] = set()
         self._scan_lock = threading.Lock()
         self._stop = threading.Event()
         self._observer: Optional[Observer] = None
@@ -246,16 +289,94 @@ class PairRuntime:
 
     # ---- copy / delete ----
     def _copy(self, src: Path, dst: Path):
+        # Suppress the destination BEFORE writing so the watcher's own echo for
+        # the write is ignored even while a large copy is in progress.
+        self.suppress.add(str(dst))
         dst.parent.mkdir(parents=True, exist_ok=True)
         if src.is_dir():
             dst.mkdir(parents=True, exist_ok=True)
         else:
             shutil.copy2(src, dst)
-        self.suppress.add(str(dst))
 
-    def _delete(self, target: Path) -> bool:
+    def _delete(self, target: Path, rel: str, save: bool = False) -> bool:
+        """Delete ``target`` (the mirror of ``rel``) and forget its sync-state.
+
+        State is forgotten only once the delete actually succeeds. If the delete
+        has to be queued (file locked / cloud lock), ``rel`` is parked in
+        ``_pending_delete`` so a concurrent scan won't copy it back, and the
+        state is forgotten later when the retry finally lands.
+        """
         self.suppress.add(str(target))
-        return self.delete_q.attempt_delete(target)
+
+        def _on_done(success: bool, r: str = rel):
+            if success:
+                self._finish_delete(r, save=True)
+            else:
+                # Abandoned: stop treating it as in-flight so normal logic can
+                # retry on the next scan (state stays 'known' on purpose).
+                self._pending_delete.discard(r)
+
+        ok = self.delete_q.attempt_delete(target, on_done=_on_done)
+        if ok:
+            self._finish_delete(rel, save=save)
+        else:
+            self._pending_delete.add(rel)
+        return ok
+
+    def _finish_delete(self, rel: str, save: bool = True):
+        self.state.forget(rel)
+        self._pending_delete.discard(rel)
+        if save:
+            self.state.save()
+
+    def _delete_empty_dir(self, target: Path, rel: str) -> bool:
+        """Remove an *empty* directory only — never recurse, so we can't nuke
+        files that appeared after the scan. Returns True if removed."""
+        self.suppress.add(str(target))
+        try:
+            if target.exists():
+                target.rmdir()  # raises OSError if not empty
+            self.state.forget(rel)
+            return True
+        except OSError:
+            return False
+
+    # ---- mass-delete safety ----
+    def _mass_delete_guard(self, map_a: dict, map_b: dict, reason: str) -> Optional[str]:
+        """Return an abort message if an AUTOMATIC scan is about to propagate a
+        suspicious number of deletions — the signature of a cloud drive (e.g. Z:)
+        going offline/empty while sync-state still knows its files. Returns None
+        when it is safe to proceed.
+
+        A manual "Sync now" is an explicit, trusted action and is never blocked.
+        Ordinary small deletions stream through the watcher one file at a time,
+        so they never reach these thresholds."""
+        if not self.cfg.delete_orphans or reason == "manual":
+            return None
+        known = self.state.known_count()
+        if known == 0:
+            return None
+        would_delete = 0
+        for rel in self.state.known_keys():
+            in_a, in_b = rel in map_a, rel in map_b
+            if self.cfg.mode == "twoway":
+                if in_a != in_b:      # known, now present on exactly one side
+                    would_delete += 1
+            else:                      # oneway mirror: known but gone from source A
+                if not in_a:
+                    would_delete += 1
+        if would_delete == 0:
+            return None
+        if would_delete >= DELETE_SAFETY_MIN:
+            return (f"{would_delete}/{known} known files would be deleted in one automatic "
+                    f"pass — refusing (looks like a drive glitch). Use 'Sync now' to force.")
+        whole_side = (not map_a and map_b) or (not map_b and map_a)
+        if whole_side and would_delete >= DELETE_SAFETY_WHOLE_MIN:
+            empty = "A" if not map_a else "B"
+            return (f"folder {empty} reads as EMPTY and {would_delete} previously-synced files "
+                    f"would be deleted — refusing (check the drive/mount is online). "
+                    f"Use 'Sync now' to force.")
+        return None
 
     # ---- full scan (both modes) ----
     def full_sync(self, reason: str = "manual"):
@@ -286,6 +407,13 @@ class PairRuntime:
             map_b = self._walk(b)
             all_paths = sorted(set(map_a) | set(map_b))
             total = len(all_paths)
+
+            abort = self._mass_delete_guard(map_a, map_b, reason)
+            if abort:
+                self._log("error", f"Aborting sync: {abort}")
+                self._set_status("error")
+                return
+
             self._progress(f"Comparing {total} files", 40, 0, total)
             copies = dels = skips = errs = 0
             for idx, rel in enumerate(all_paths):
@@ -297,19 +425,49 @@ class PairRuntime:
                     in_b = rel in map_b
                     src_path_a = a / rel
                     src_path_b = b / rel
-                    # Handle directory markers
+                    # Handle (empty) directory markers
                     if rel.endswith("/"):
+                        if rel in self._pending_delete:
+                            continue
                         actual_rel = rel.rstrip("/")
                         pa = a / actual_rel
                         pb = b / actual_rel
-                        if in_a and not in_b:
-                            pb.mkdir(parents=True, exist_ok=True)
-                            copies += 1
-                            self.state.record(rel, 0, -1, "a")
-                        elif in_b and not in_a and self.cfg.mode == "twoway":
-                            pa.mkdir(parents=True, exist_ok=True)
-                            copies += 1
-                            self.state.record(rel, 0, -1, "b")
+                        if self.cfg.mode == "oneway":
+                            if in_a:
+                                if not in_b:
+                                    pb.mkdir(parents=True, exist_ok=True)
+                                    copies += 1
+                                if not self.state.was_known(rel):
+                                    self.state.record(rel, 0, -1, "a")
+                            elif self.cfg.delete_orphans:  # in B only → not in source
+                                if self._delete_empty_dir(pb, rel):
+                                    dels += 1
+                            continue
+                        # twoway
+                        if in_a and in_b:
+                            if not self.state.was_known(rel):
+                                self.state.record(rel, 0, -1, "both")
+                        elif in_a:  # in A only
+                            if self.state.was_known(rel) and self.cfg.delete_orphans:
+                                if self._delete_empty_dir(pa, rel):
+                                    dels += 1
+                            else:
+                                pb.mkdir(parents=True, exist_ok=True)
+                                copies += 1
+                                self.state.record(rel, 0, -1, "a")
+                        else:  # in B only
+                            if self.state.was_known(rel) and self.cfg.delete_orphans:
+                                if self._delete_empty_dir(pb, rel):
+                                    dels += 1
+                            else:
+                                pa.mkdir(parents=True, exist_ok=True)
+                                copies += 1
+                                self.state.record(rel, 0, -1, "b")
+                        continue
+
+                    # A delete for this path is in flight (queued retry) — don't
+                    # recreate it or re-handle until that delete resolves.
+                    if rel in self._pending_delete:
                         continue
 
                     if in_a and not in_b:
@@ -318,8 +476,7 @@ class PairRuntime:
                             if self.state.was_known(rel):
                                 # was synced before, now gone from B → delete from A
                                 if self.cfg.delete_orphans:
-                                    self._delete(src_path_a)
-                                    self.state.forget(rel)
+                                    self._delete(src_path_a, rel)
                                     dels += 1
                                     continue
                             self._copy(src_path_a, src_path_b)
@@ -333,8 +490,7 @@ class PairRuntime:
                         if self.cfg.mode == "twoway":
                             if self.state.was_known(rel):
                                 if self.cfg.delete_orphans:
-                                    self._delete(src_path_b)
-                                    self.state.forget(rel)
+                                    self._delete(src_path_b, rel)
                                     dels += 1
                                     continue
                             self._copy(src_path_b, src_path_a)
@@ -342,8 +498,7 @@ class PairRuntime:
                             copies += 1
                         else:  # oneway: B is mirror, missing in A → delete from B
                             if self.cfg.delete_orphans:
-                                self._delete(src_path_b)
-                                self.state.forget(rel)
+                                self._delete(src_path_b, rel)
                                 dels += 1
                     else:  # in both — compare
                         ma = map_a[rel]["mtime"]
@@ -351,6 +506,11 @@ class PairRuntime:
                         sa = map_a[rel]["size"]
                         sb = map_b[rel]["size"]
                         if sa == sb and abs(ma - mb) < 1.0:
+                            # Identical → record as known so a future deletion of
+                            # this file is recognised as a delete (and propagated)
+                            # rather than mistaken for a brand-new file (copied back).
+                            if not self.state.was_known(rel):
+                                self.state.record(rel, ma, sa, "both")
                             skips += 1
                             continue
                         if sa == sb:
@@ -412,6 +572,9 @@ class PairRuntime:
         b = Path(self.cfg.folder_b)
         src_a = a / rel
         src_b = b / rel
+        # A delete for this path is queued/retrying — don't recreate it.
+        if rel in self._pending_delete:
+            return
         a_exists = src_a.exists()
         b_exists = src_b.exists()
         if self.cfg.mode == "twoway":
@@ -423,8 +586,7 @@ class PairRuntime:
                 return
             if a_exists and not b_exists:
                 if self.state.was_known(rel) and self.cfg.delete_orphans:
-                    self._delete(src_a)
-                    self.state.forget(rel)
+                    self._delete(src_a, rel)
                 else:
                     self._copy(src_a, src_b)
                     try:
@@ -434,8 +596,7 @@ class PairRuntime:
                         pass
             elif b_exists and not a_exists:
                 if self.state.was_known(rel) and self.cfg.delete_orphans:
-                    self._delete(src_b)
-                    self.state.forget(rel)
+                    self._delete(src_b, rel)
                 else:
                     self._copy(src_b, src_a)
                     try:
@@ -448,10 +609,18 @@ class PairRuntime:
                     sa = src_a.stat()
                     sb = src_b.stat()
                     if sa.st_size == sb.st_size and abs(sa.st_mtime - sb.st_mtime) < 1.0:
+                        # Identical — make sure it's recorded as known so a later
+                        # deletion propagates instead of being copied back.
+                        if not self.state.was_known(rel):
+                            self.state.record(rel, sa.st_mtime, sa.st_size, "both")
+                            self.state.save()
                         return
                     if sa.st_size == sb.st_size:
                         ha, hb = md5_of(src_a), md5_of(src_b)
                         if ha and hb and ha == hb:
+                            if not self.state.was_known(rel):
+                                self.state.record(rel, max(sa.st_mtime, sb.st_mtime), sa.st_size, "both")
+                                self.state.save()
                             return
                     if sa.st_mtime >= sb.st_mtime:
                         self._copy(src_a, src_b)
@@ -471,8 +640,7 @@ class PairRuntime:
                     pass
             else:
                 if self.cfg.delete_orphans and b_exists:
-                    self._delete(src_b)
-                    self.state.forget(rel)
+                    self._delete(src_b, rel)
         self.state.save()
         self.cfg.last_sync = datetime.now().isoformat(timespec="seconds")
 
