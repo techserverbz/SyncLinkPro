@@ -7,6 +7,11 @@ let activePairId = null;
 let currentFilter = "all";
 let editingId = null;
 let pickerTarget = null; // 'a' | 'b'
+// Per-pair live progress — keyed by pair id. Cleared when the pair leaves
+// "syncing" status so the sidebar strip disappears. Lets us surface progress
+// for ANY currently-syncing pair (scheduled / safety-scan / manual), not just
+// the one the user happens to have selected.
+let pairProgress = {}; // { [id]: { phase: string, percent: number } }
 
 // ---------- API ----------
 const api = {
@@ -29,10 +34,18 @@ function renderSidebar() {
     const li = document.createElement("li");
     li.className = "pair-item" + (p.id === activePairId ? " active" : "");
     const dotClass = p.paused ? "paused" : (p.status || "idle");
+    const prog = pairProgress[p.id];
+    const showProg = !p.paused && (p.status === "syncing") && prog;
     li.innerHTML = `
-      <span class="dot ${dotClass}"></span>
-      <span class="pair-name">${escape(p.name)}</span>
-      <span class="pair-mode">1W</span>
+      <div class="pair-row">
+        <span class="dot ${dotClass}"></span>
+        <span class="pair-name">${escape(p.name)}</span>
+        ${showProg ? `<span class="pair-pct mono">${prog.percent || 0}%</span>` : ""}
+        <span class="pair-mode">1W</span>
+      </div>
+      ${showProg
+        ? `<div class="pair-progress"><div class="pair-progress-fill" style="width:${prog.percent || 0}%"></div></div>`
+        : ""}
     `;
     li.onclick = () => selectPair(p.id);
     list.appendChild(li);
@@ -116,9 +129,13 @@ function connectWS() {
   };
   ws.onmessage = (e) => {
     const data = JSON.parse(e.data);
-    // Progress events: update bar only, don't spam logs
+    // Progress events: store per-pair, update detail bar if active, refresh
+    // sidebar so the inline strip moves for whichever pair is syncing (even
+    // when that pair isn't selected — e.g. scheduled / safety-scan).
     if (data.level === "progress") {
+      pairProgress[data.pair_id] = { phase: data.message, percent: data.percent || 0 };
       if (data.pair_id === activePairId) updateProgress(data.message, data.percent);
+      renderSidebar();
       return;
     }
     // Append to current view logs if active pair
@@ -130,7 +147,16 @@ function connectWS() {
     // Update pair status in-place
     if (data.level === "status") {
       const p = pairs.find(x => x.id === data.pair_id);
-      if (p) { p.status = data.message; renderSidebar(); if (p.id === activePairId) renderDetail(); }
+      if (p) { p.status = data.message; }
+      // Seed/clear per-pair progress so the sidebar strip appears at sync
+      // start and disappears the moment sync ends.
+      if (data.message === "syncing") {
+        if (!pairProgress[data.pair_id]) pairProgress[data.pair_id] = { phase: "Starting…", percent: 0 };
+      } else {
+        delete pairProgress[data.pair_id];
+      }
+      renderSidebar();
+      if (p && p.id === activePairId) renderDetail();
       if (data.pair_id === activePairId) {
         if (data.message === "syncing") showProgress();
         else hideProgress();

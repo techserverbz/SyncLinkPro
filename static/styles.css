@@ -77,9 +77,30 @@ html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text);
   cursor: pointer;
   border: 1px solid transparent;
   display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: background 0.15s, border 0.15s;
+}
+.pair-row {
+  display: flex;
   align-items: center;
   gap: 10px;
-  transition: background 0.15s, border 0.15s;
+}
+.pair-pct {
+  font-size: 10px;
+  color: var(--accent);
+  letter-spacing: 0.5px;
+}
+.pair-progress {
+  height: 2px;
+  background: var(--bg-overlay);
+  border-radius: 1px;
+  overflow: hidden;
+}
+.pair-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.3s ease;
 }
 .pair-item:hover { background: var(--bg-overlay); }
 .pair-item.active {
