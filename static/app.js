@@ -103,36 +103,35 @@ async function selectPair(id) {
   activePairId = id;
   renderSidebar();
   renderDetail();
-  // If a sync is already in flight when we land on this pair, surface the bar
-  // immediately with whatever progress we've cached from WS events instead of
-  // waiting for the next progress tick.
-  const p = pairs.find(x => x.id === id);
-  if (p && p.status === "syncing") {
-    showProgress();
-    const cached = pairProgress[id];
-    if (cached) updateProgress(cached.phase, cached.percent);
-  } else {
-    hideProgress();
-  }
+  // Refresh the detail-panel bar for the pair we just opened. Crucial: always
+  // reset the bar's text + fill FIRST so we never leak the previous pair's
+  // values (e.g. Claude Brain at 70% while we open Drive→Desktop, which has
+  // no live progress yet). Then re-populate from cached state if this pair
+  // is currently syncing.
+  showProgressForActivePair();
   const logs = await api.logs(id);
   renderLogs(logs);
+}
+
+// Reset + repopulate the detail-panel progress widget based on whatever pair
+// is currently active. Hides the bar if the active pair isn't syncing.
+function showProgressForActivePair() {
+  // Always start from a clean slate so no other pair's values bleed through.
+  updateProgress("", 0);
+  if (!activePairId) { hideProgress(); return; }
+  const p = pairs.find(x => x.id === activePairId);
+  if (!p || p.status !== "syncing") { hideProgress(); return; }
+  showProgress();
+  const cached = pairProgress[activePairId];
+  if (cached) updateProgress(cached.phase, cached.percent);
 }
 
 async function refreshAll() {
   pairs = await api.listPairs();
   renderSidebar();
   renderDetail();
+  showProgressForActivePair();
   if (activePairId) {
-    // Same in-flight-sync handling as selectPair — page reload during a sync
-    // should still show the bar.
-    const p = pairs.find(x => x.id === activePairId);
-    if (p && p.status === "syncing") {
-      showProgress();
-      const cached = pairProgress[activePairId];
-      if (cached) updateProgress(cached.phase, cached.percent);
-    } else {
-      hideProgress();
-    }
     const logs = await api.logs(activePairId);
     renderLogs(logs);
   }
