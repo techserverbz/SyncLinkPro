@@ -7,6 +7,7 @@ Open:  http://localhost:7878
 """
 from __future__ import annotations
 import asyncio
+import os
 import secrets
 import string
 import threading
@@ -152,6 +153,53 @@ def _id() -> str:
     return "".join(secrets.choice(alphabet) for _ in range(10))
 
 
+def _dangerous_root(rp: Path) -> Optional[str]:
+    """Return why a path is too dangerous to sync (drive root / system folder),
+    or None if it's a safe ordinary folder."""
+    if rp == Path(rp.anchor):  # e.g. C:\ or Z:\
+        return "a whole drive root"
+    blocked: set[Path] = set()
+    for ev in ("SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"):
+        v = os.environ.get(ev)
+        if v:
+            try:
+                blocked.add(Path(v).resolve())
+            except Exception:
+                pass
+    try:
+        home = Path.home().resolve()
+        blocked.add(home)          # the user-profile root itself
+        blocked.add(home.parent)   # C:\Users
+    except Exception:
+        pass
+    if rp in blocked:
+        return f"a protected system folder ({rp})"
+    return None
+
+
+def _validate_pair(folder_a: str, folder_b: str):
+    """Reject dangerous topologies BEFORE a pair can ever sync: missing folders,
+    identical/nested pairs, or drive-root/system-folder selections. A bad pair
+    here is an 'absurd' way to delete files, so we stop it at the door."""
+    a = Path(folder_a).expanduser()
+    b = Path(folder_b).expanduser()
+    for p in (a, b):
+        if not p.exists() or not p.is_dir():
+            raise HTTPException(400, f"Folder does not exist: {p}")
+    try:
+        ra, rb = a.resolve(), b.resolve()
+    except Exception:
+        raise HTTPException(400, "Could not resolve one of the folders.")
+    if ra == rb:
+        raise HTTPException(400, "Folder A and Folder B must be different folders.")
+    if ra.is_relative_to(rb) or rb.is_relative_to(ra):
+        raise HTTPException(400, "Folder A and Folder B must not be nested inside each other.")
+    for p in (ra, rb):
+        why = _dangerous_root(p)
+        if why:
+            raise HTTPException(400, f"Refusing to sync {why}: {p}. Pick a specific subfolder instead.")
+
+
 # ---- routes ----
 @app.get("/api/pairs")
 def list_pairs():
@@ -160,9 +208,7 @@ def list_pairs():
 
 @app.post("/api/pairs")
 def create_pair(body: PairCreate):
-    for path in (body.folder_a, body.folder_b):
-        if not Path(path).expanduser().exists():
-            raise HTTPException(400, f"Folder does not exist: {path}")
+    _validate_pair(body.folder_a, body.folder_b)
     cfg = SyncPairConfig(
         id=_id(),
         name=body.name,
@@ -174,7 +220,7 @@ def create_pair(body: PairCreate):
         ignore_dirs=body.ignore_dirs,
         ignore_files=body.ignore_files,
         ignore_patterns=body.ignore_patterns,
-        delete_orphans=body.delete_orphans,
+        delete_orphans=True,  # delete propagation is always on (not user-toggleable)
         safety_scan_interval=body.safety_scan_interval,
     )
     pair = engine.add_pair(cfg)
@@ -187,6 +233,11 @@ def update_pair(pid: str, body: PairPatch):
     if pid not in engine.pairs:
         raise HTTPException(404, "Pair not found")
     patch = {k: v for k, v in body.model_dump().items() if v is not None}
+    # Validate path topology whenever either folder is being changed.
+    if "folder_a" in patch or "folder_b" in patch:
+        cur = engine.pairs[pid].cfg
+        _validate_pair(patch.get("folder_a", cur.folder_a), patch.get("folder_b", cur.folder_b))
+    patch["delete_orphans"] = True  # always on, regardless of client input
     pair = engine.update_pair(pid, patch)
     _reschedule(pid)
     return pair.to_dict()

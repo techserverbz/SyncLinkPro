@@ -34,15 +34,21 @@ DELETE_MAX_RETRIES = 30
 DELETE_INITIAL_DELAY = 2.0
 SUPPRESS_TTL = 5.0
 
-# Safety net against catastrophic mass-deletes (e.g. a cloud drive going
-# offline / reading empty). An AUTOMATIC full scan refuses to propagate deletes
-# when too many previously-synced files would vanish at once. A manual "Sync
-# now" is treated as an explicit, trusted action and is never blocked.
-DELETE_SAFETY_MIN = 25          # block an auto scan deleting at least this many files
-DELETE_SAFETY_WHOLE_MIN = 5     # ...or this many when a whole side reads empty
+# Live-watcher delete circuit-breaker: if more than this many deletes are
+# propagated within the window, the pair pauses itself and asks for a manual
+# resume. Set high enough that ordinary deleting never trips it.
+LIVE_DELETE_BURST = 50
+LIVE_DELETE_WINDOW = 10.0       # seconds
+
+# Hidden marker written into each synced root after a clean scan. Its presence
+# proves the folder is the real, online, hydrated sync root — so a folder that
+# reads empty WITHOUT its marker is treated as offline/glitching, not "emptied
+# by the user", and deletions are refused. Never synced (it is ignored below).
+SENTINEL_NAME = ".synclinkpro-online"
 
 DEFAULT_IGNORE_FILES = {
     "desktop.ini", "thumbs.db", ".ds_store",
+    SENTINEL_NAME,
 }
 DEFAULT_IGNORE_PATTERNS = ("~$*", "*.tmp", "*.temp", "*.swp", "*.lock")
 DEFAULT_IGNORE_DIRS = {
@@ -81,6 +87,11 @@ class SyncState:
     def __init__(self, pair_id: str):
         self.path = STATE_ROOT / "sync-state" / f"{pair_id}.json"
         self.data: dict = {}
+        # True when an existing state file failed to parse (corruption). While
+        # suspect, the engine refuses to DELETE (only copies/records) until a
+        # clean save() re-establishes a trusted baseline — a corrupt/empty state
+        # must never be read as "everything was deleted".
+        self.suspect = False
         self._lock = threading.Lock()
         self._load()
 
@@ -89,7 +100,10 @@ class SyncState:
             try:
                 self.data = json.loads(self.path.read_text(encoding="utf-8"))
             except Exception:
+                # File exists but won't parse → corruption. Keep empty data but
+                # flag as suspect so deletes are suppressed until re-baselined.
                 self.data = {}
+                self.suspect = True
 
     def save(self):
         # Snapshot under the lock so we never serialize a dict that another
@@ -99,6 +113,7 @@ class SyncState:
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(payload, encoding="utf-8")
         tmp.replace(self.path)
+        self.suspect = False  # a clean write re-establishes a trusted baseline
 
     def record(self, relpath: str, mtime: float, size: int, source: str):
         with self._lock:
@@ -245,6 +260,8 @@ class PairRuntime:
         self._events_lock = threading.Lock()
         self._debounce_thread: Optional[threading.Thread] = None
         self.status = "idle"  # idle | syncing | error | paused
+        # Rolling timestamps of recent live-watcher deletes (circuit breaker).
+        self._recent_deletes: list[float] = []
 
     # ---- logging helpers ----
     def _log(self, level: str, message: str, extra: Optional[dict] = None):
@@ -264,12 +281,74 @@ class PairRuntime:
     def _ignore_dir(self, name: str) -> bool:
         return should_ignore_dir(name, set(self.cfg.ignore_dirs))
 
+    # ---- online / health detection ----
+    def _ensure_sentinel(self, root: Path):
+        """Drop the hidden online-marker into a root after a trusted scan. Written
+        once (not rewritten every scan) and hidden on Windows so it doesn't
+        clutter the folder or churn cloud uploads."""
+        try:
+            marker = root / SENTINEL_NAME
+            if marker.exists():
+                return
+            self.suppress.add(str(marker))
+            marker.write_text("online", encoding="utf-8")
+            if os.name == "nt":
+                try:
+                    import ctypes
+                    ctypes.windll.kernel32.SetFileAttributesW(str(marker), 0x02)  # HIDDEN
+                except Exception:
+                    pass
+        except Exception:
+            pass  # best-effort; absence just means "be cautious"
+
+    def _has_sentinel(self, root: Path) -> bool:
+        try:
+            return (root / SENTINEL_NAME).exists()
+        except Exception:
+            return False
+
+    def _side_online(self, root: Path, file_map: Optional[dict] = None) -> bool:
+        """A side is 'online' (safe to treat its absences as real deletions)
+        only if it exists, is a readable directory, and — once a baseline has
+        been established — still carries its sentinel. A folder that reads empty
+        but has lost its sentinel is offline/unhydrated, NOT genuinely emptied.
+
+        When no baseline exists yet (fresh pair, nothing known), there is nothing
+        to delete, so we don't require the sentinel."""
+        try:
+            if not root.exists() or not root.is_dir():
+                return False
+        except Exception:
+            return False
+        # No baseline → nothing can be deleted anyway; treat as online.
+        if self.state.known_count() == 0:
+            return True
+        # With a baseline, trust the side only if its sentinel survived. If the
+        # side still clearly has content (non-empty map) we tolerate a missing
+        # sentinel (e.g. first run after this upgrade) — the danger case is an
+        # EMPTY/near-empty read, which without a sentinel we must not trust.
+        if self._has_sentinel(root):
+            return True
+        if file_map is not None and len(file_map) == 0:
+            return False
+        return True
+
     # ---- scan ----
-    def _walk(self, root: Path) -> dict[str, dict]:
+    def _walk(self, root: Path) -> tuple[dict[str, dict], bool]:
+        """Return (file_map, had_errors). ``had_errors`` is True if any directory
+        could not be listed or any file could not be stat'd — in which case the
+        listing is INCOMPLETE and callers must NOT infer deletions from it."""
         out: dict[str, dict] = {}
+        had_errors = False
         if not root.exists():
-            return out
-        for dirpath, dirnames, filenames in os.walk(root):
+            return out, had_errors
+
+        def _on_walk_error(err: OSError):
+            nonlocal had_errors
+            had_errors = True
+            self._log("warn", f"Read error while scanning {getattr(err, 'filename', root)}: {err}")
+
+        for dirpath, dirnames, filenames in os.walk(root, onerror=_on_walk_error):
             dirnames[:] = [d for d in dirnames if not self._ignore_dir(d)]
             rel_dir = Path(dirpath).relative_to(root).as_posix()
             for fname in filenames:
@@ -281,11 +360,13 @@ class PairRuntime:
                     st = full.stat()
                     out[rel] = {"mtime": st.st_mtime, "size": st.st_size, "is_dir": False}
                 except Exception:
+                    # Couldn't stat a file that DOES exist → incomplete read.
+                    had_errors = True
                     continue
             # track empty dirs
             if not filenames and not dirnames and rel_dir != ".":
                 out[rel_dir + "/"] = {"mtime": 0, "size": -1, "is_dir": True}
-        return out
+        return out, had_errors
 
     # ---- copy / delete ----
     def _copy(self, src: Path, dst: Path):
@@ -341,42 +422,61 @@ class PairRuntime:
         except OSError:
             return False
 
-    # ---- mass-delete safety ----
-    def _mass_delete_guard(self, map_a: dict, map_b: dict, reason: str) -> Optional[str]:
-        """Return an abort message if an AUTOMATIC scan is about to propagate a
-        suspicious number of deletions — the signature of a cloud drive (e.g. Z:)
-        going offline/empty while sync-state still knows its files. Returns None
-        when it is safe to proceed.
+    def _register_delete_and_guard(self) -> bool:
+        """Record a live deletion; trip a circuit-breaker on a burst. Returns
+        False (and PAUSES the pair) if too many deletes happen too fast — the
+        signature of something going wrong rather than deliberate editing."""
+        now = time.time()
+        self._recent_deletes = [t for t in self._recent_deletes if now - t < LIVE_DELETE_WINDOW]
+        self._recent_deletes.append(now)
+        if len(self._recent_deletes) > LIVE_DELETE_BURST:
+            self.cfg.paused = True
+            self._set_status("paused")
+            self._log("error",
+                      f"Delete circuit-breaker tripped (> {LIVE_DELETE_BURST} deletions in "
+                      f"{LIVE_DELETE_WINDOW:.0f}s). Pair PAUSED — resume manually after checking.")
+            return False
+        return True
 
-        A manual "Sync now" is an explicit, trusted action and is never blocked.
-        Ordinary small deletions stream through the watcher one file at a time,
-        so they never reach these thresholds."""
-        if not self.cfg.delete_orphans or reason == "manual":
-            return None
-        known = self.state.known_count()
-        if known == 0:
-            return None
-        would_delete = 0
-        for rel in self.state.known_keys():
-            in_a, in_b = rel in map_a, rel in map_b
-            if self.cfg.mode == "twoway":
-                if in_a != in_b:      # known, now present on exactly one side
-                    would_delete += 1
-            else:                      # oneway mirror: known but gone from source A
-                if not in_a:
-                    would_delete += 1
-        if would_delete == 0:
-            return None
-        if would_delete >= DELETE_SAFETY_MIN:
-            return (f"{would_delete}/{known} known files would be deleted in one automatic "
-                    f"pass — refusing (looks like a drive glitch). Use 'Sync now' to force.")
-        whole_side = (not map_a and map_b) or (not map_b and map_a)
-        if whole_side and would_delete >= DELETE_SAFETY_WHOLE_MIN:
-            empty = "A" if not map_a else "B"
-            return (f"folder {empty} reads as EMPTY and {would_delete} previously-synced files "
-                    f"would be deleted — refusing (check the drive/mount is online). "
-                    f"Use 'Sync now' to force.")
-        return None
+    def _live_delete_allowed(self, vanished_root: Path, rel: str) -> bool:
+        """Gate a live deletion: allow it only when the side that LOST the file
+        is genuinely online, the state is trusted, and the burst-breaker is ok.
+        A file that 'vanished' because its drive went offline is NOT a deletion."""
+        if self.state.suspect:
+            self._log("warn", f"Skipping delete of {rel}: sync-state untrusted (corrupt?)")
+            return False
+        if not self._side_online(vanished_root):
+            self._log("warn", f"Skipping delete of {rel}: source folder looks offline")
+            return False
+        return self._register_delete_and_guard()
+
+    # ---- delete safety preflight ----
+    def _preflight(self, a: Path, b: Path, map_a: dict, err_a: bool,
+                   map_b: dict, err_b: bool) -> tuple[Optional[str], Optional[str]]:
+        """Decide, BEFORE touching anything, whether this scan is trustworthy.
+
+        Returns ``(abort, block_deletes)``:
+        - ``abort``: a message → do nothing at all (a side is offline/unreadable;
+          acting on it could wipe the live data). Applies to manual too.
+        - ``block_deletes``: a message → still copy/record, but DO NOT delete
+          (the listing is incomplete or the baseline is untrusted).
+
+        The point: a *real* deletion (folder online, readable, file genuinely
+        gone) propagates; an *absurd* one (drive offline, empty glitch, partial
+        read, corrupt state) never does."""
+        if not self._side_online(a, map_a):
+            return (f"folder A ({a}) is offline, empty without its marker, or unreadable "
+                    f"— refusing to sync to avoid deleting real files", None)
+        if not self._side_online(b, map_b):
+            return (f"folder B ({b}) is offline, empty without its marker, or unreadable "
+                    f"— refusing to sync to avoid deleting real files", None)
+        if err_a or err_b:
+            return (None, "read errors during scan — skipping deletions this pass "
+                          "(copies still applied; some files were unreadable)")
+        if self.state.suspect:
+            return (None, "sync-state file was unreadable/corrupt — skipping deletions "
+                          "until a clean baseline is re-established")
+        return (None, None)
 
     # ---- full scan (both modes) ----
     def full_sync(self, reason: str = "manual"):
@@ -391,28 +491,26 @@ class PairRuntime:
             self._log("info", f"Full sync started ({reason})")
             a = Path(self.cfg.folder_a)
             b = Path(self.cfg.folder_b)
-            if not a.exists():
-                self._log("error", f"Folder A missing: {a}")
-                self._set_status("error")
-                return
-            if self.cfg.mode == "twoway" and not b.exists():
-                b.mkdir(parents=True, exist_ok=True)
-                self._log("info", f"Created destination: {b}")
-            elif self.cfg.mode == "oneway" and not b.exists():
-                b.mkdir(parents=True, exist_ok=True)
 
             self._progress("Scanning folder A", 5)
-            map_a = self._walk(a)
+            map_a, err_a = self._walk(a)
             self._progress("Scanning folder B", 25)
-            map_b = self._walk(b)
+            map_b, err_b = self._walk(b)
             all_paths = sorted(set(map_a) | set(map_b))
             total = len(all_paths)
 
-            abort = self._mass_delete_guard(map_a, map_b, reason)
+            # Trust check BEFORE any mutation. We never auto-create a vanished
+            # destination — a missing/empty-without-marker folder means the drive
+            # is OFFLINE, not "the user emptied it", so we refuse rather than
+            # mirror the emptiness back as deletions.
+            abort, block_deletes = self._preflight(a, b, map_a, err_a, map_b, err_b)
             if abort:
                 self._log("error", f"Aborting sync: {abort}")
                 self._set_status("error")
                 return
+            if block_deletes:
+                self._log("warn", block_deletes)
+            delete_ok = self.cfg.delete_orphans and not block_deletes
 
             self._progress(f"Comparing {total} files", 40, 0, total)
             copies = dels = skips = errs = 0
@@ -439,7 +537,7 @@ class PairRuntime:
                                     copies += 1
                                 if not self.state.was_known(rel):
                                     self.state.record(rel, 0, -1, "a")
-                            elif self.cfg.delete_orphans:  # in B only → not in source
+                            elif delete_ok:  # in B only → not in source
                                 if self._delete_empty_dir(pb, rel):
                                     dels += 1
                             continue
@@ -448,7 +546,7 @@ class PairRuntime:
                             if not self.state.was_known(rel):
                                 self.state.record(rel, 0, -1, "both")
                         elif in_a:  # in A only
-                            if self.state.was_known(rel) and self.cfg.delete_orphans:
+                            if self.state.was_known(rel) and delete_ok:
                                 if self._delete_empty_dir(pa, rel):
                                     dels += 1
                             else:
@@ -456,7 +554,7 @@ class PairRuntime:
                                 copies += 1
                                 self.state.record(rel, 0, -1, "a")
                         else:  # in B only
-                            if self.state.was_known(rel) and self.cfg.delete_orphans:
+                            if self.state.was_known(rel) and delete_ok:
                                 if self._delete_empty_dir(pb, rel):
                                     dels += 1
                             else:
@@ -475,7 +573,7 @@ class PairRuntime:
                         if self.cfg.mode == "twoway":
                             if self.state.was_known(rel):
                                 # was synced before, now gone from B → delete from A
-                                if self.cfg.delete_orphans:
+                                if delete_ok:
                                     self._delete(src_path_a, rel)
                                     dels += 1
                                     continue
@@ -489,7 +587,7 @@ class PairRuntime:
                     elif in_b and not in_a:
                         if self.cfg.mode == "twoway":
                             if self.state.was_known(rel):
-                                if self.cfg.delete_orphans:
+                                if delete_ok:
                                     self._delete(src_path_b, rel)
                                     dels += 1
                                     continue
@@ -497,7 +595,7 @@ class PairRuntime:
                             self.state.record(rel, map_b[rel]["mtime"], map_b[rel]["size"], "b")
                             copies += 1
                         else:  # oneway: B is mirror, missing in A → delete from B
-                            if self.cfg.delete_orphans:
+                            if delete_ok:
                                 self._delete(src_path_b, rel)
                                 dels += 1
                     else:  # in both — compare
@@ -535,6 +633,11 @@ class PairRuntime:
                     errs += 1
                     self._log("error", f"Sync error for {rel}: {e}")
             self.state.save()
+            # Both sides passed the online check above; drop the online-marker so
+            # a future scan can tell "drive online but emptied by user" (marker
+            # present) from "drive offline / not hydrated" (marker gone).
+            self._ensure_sentinel(a)
+            self._ensure_sentinel(b)
             self.cfg.last_sync = datetime.now().isoformat(timespec="seconds")
             self._progress("Done", 100, total, total)
             self._log("info", f"Full sync done — copied: {copies}, deleted: {dels}, skipped: {skips}, errors: {errs}")
@@ -586,7 +689,9 @@ class PairRuntime:
                 return
             if a_exists and not b_exists:
                 if self.state.was_known(rel) and self.cfg.delete_orphans:
-                    self._delete(src_a, rel)
+                    # File gone from B → delete from A only if B is truly online.
+                    if self._live_delete_allowed(b, rel):
+                        self._delete(src_a, rel)
                 else:
                     self._copy(src_a, src_b)
                     try:
@@ -596,7 +701,9 @@ class PairRuntime:
                         pass
             elif b_exists and not a_exists:
                 if self.state.was_known(rel) and self.cfg.delete_orphans:
-                    self._delete(src_b, rel)
+                    # File gone from A → delete from B only if A is truly online.
+                    if self._live_delete_allowed(a, rel):
+                        self._delete(src_b, rel)
                 else:
                     self._copy(src_b, src_a)
                     try:
@@ -640,7 +747,9 @@ class PairRuntime:
                     pass
             else:
                 if self.cfg.delete_orphans and b_exists:
-                    self._delete(src_b, rel)
+                    # File gone from source A → delete mirror only if A is online.
+                    if self._live_delete_allowed(a, rel):
+                        self._delete(src_b, rel)
         self.state.save()
         self.cfg.last_sync = datetime.now().isoformat(timespec="seconds")
 

@@ -177,7 +177,9 @@ function openModal(pair = null) {
   $("#f-idirs").value = pair ? (pair.ignore_dirs || []).join(", ") : DEFAULT_IGNORE_DIRS.join(", ");
   $("#f-ipat").value = pair ? (pair.ignore_patterns || []).join(", ") : DEFAULT_IGNORE_PATTERNS.join(", ");
   $("#f-safety").value = pair?.safety_scan_interval ?? "";
-  $("#f-orphans").checked = pair ? !!pair.delete_orphans : true;
+  // Delete propagation is always on and not user-toggleable.
+  $("#f-orphans").checked = true;
+  $("#f-orphans").disabled = true;
   toggleScheduleVisible();
   $("#modal").classList.remove("hidden");
 }
@@ -200,7 +202,7 @@ async function saveModal() {
     ignore_dirs: split($("#f-idirs").value),
     ignore_patterns: split($("#f-ipat").value),
     safety_scan_interval: $("#f-safety").value ? parseInt($("#f-safety").value, 10) : null,
-    delete_orphans: $("#f-orphans").checked,
+    delete_orphans: true,
   };
   if (!body.name || !body.folder_a || !body.folder_b) {
     alert("Name, Folder A, and Folder B are required.");
