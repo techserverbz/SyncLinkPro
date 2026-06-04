@@ -40,10 +40,10 @@ SUPPRESS_TTL = 5.0
 LIVE_DELETE_BURST = 50
 LIVE_DELETE_WINDOW = 10.0       # seconds
 
-# Hidden marker written into each synced root after a clean scan. Its presence
-# proves the folder is the real, online, hydrated sync root — so a folder that
-# reads empty WITHOUT its marker is treated as offline/glitching, not "emptied
-# by the user", and deletions are refused. Never synced (it is ignored below).
+# Legacy online-marker name. No longer written or required (online-ness is now
+# decided by whether a folder root exists and is readable). Kept in the ignore
+# set only so any leftover/cloud-resurrected marker file is never treated as a
+# real file to sync or delete.
 SENTINEL_NAME = ".synclinkpro-online"
 
 DEFAULT_IGNORE_FILES = {
@@ -282,56 +282,26 @@ class PairRuntime:
         return should_ignore_dir(name, set(self.cfg.ignore_dirs))
 
     # ---- online / health detection ----
-    def _ensure_sentinel(self, root: Path):
-        """Drop the hidden online-marker into a root after a trusted scan. Written
-        once (not rewritten every scan) and hidden on Windows so it doesn't
-        clutter the folder or churn cloud uploads."""
-        try:
-            marker = root / SENTINEL_NAME
-            if marker.exists():
-                return
-            self.suppress.add(str(marker))
-            marker.write_text("online", encoding="utf-8")
-            if os.name == "nt":
-                try:
-                    import ctypes
-                    ctypes.windll.kernel32.SetFileAttributesW(str(marker), 0x02)  # HIDDEN
-                except Exception:
-                    pass
-        except Exception:
-            pass  # best-effort; absence just means "be cautious"
+    def _side_online(self, root: Path) -> bool:
+        """A side is 'online' (safe to treat its absences as real deletions) when
+        its root EXISTS and is READABLE — even if it happens to be empty. The
+        catastrophic case we guard against is the drive being disconnected, which
+        shows up as a missing/unreadable root (the path is gone or scandir errors),
+        not as a clean empty listing. An empty-but-readable folder is genuinely
+        empty, so deletions there are real and may propagate.
 
-    def _has_sentinel(self, root: Path) -> bool:
-        try:
-            return (root / SENTINEL_NAME).exists()
-        except Exception:
-            return False
-
-    def _side_online(self, root: Path, file_map: Optional[dict] = None) -> bool:
-        """A side is 'online' (safe to treat its absences as real deletions)
-        only if it exists, is a readable directory, and — once a baseline has
-        been established — still carries its sentinel. A folder that reads empty
-        but has lost its sentinel is offline/unhydrated, NOT genuinely emptied.
-
-        When no baseline exists yet (fresh pair, nothing known), there is nothing
-        to delete, so we don't require the sentinel."""
+        A separate non-aborting backstop in full_sync still refuses to propagate a
+        WHOLE-side wipe, so a freak empty read can never mass-delete the other side."""
         try:
             if not root.exists() or not root.is_dir():
                 return False
+            # Readability probe: a half-mounted / disconnected drive errors here
+            # even when exists() returned True.
+            with os.scandir(root) as it:
+                next(it, None)
+            return True
         except Exception:
             return False
-        # No baseline → nothing can be deleted anyway; treat as online.
-        if self.state.known_count() == 0:
-            return True
-        # With a baseline, trust the side only if its sentinel survived. If the
-        # side still clearly has content (non-empty map) we tolerate a missing
-        # sentinel (e.g. first run after this upgrade) — the danger case is an
-        # EMPTY/near-empty read, which without a sentinel we must not trust.
-        if self._has_sentinel(root):
-            return True
-        if file_map is not None and len(file_map) == 0:
-            return False
-        return True
 
     # ---- scan ----
     def _walk(self, root: Path) -> tuple[dict[str, dict], bool]:
@@ -462,14 +432,14 @@ class PairRuntime:
           (the listing is incomplete or the baseline is untrusted).
 
         The point: a *real* deletion (folder online, readable, file genuinely
-        gone) propagates; an *absurd* one (drive offline, empty glitch, partial
-        read, corrupt state) never does."""
-        if not self._side_online(a, map_a):
-            return (f"folder A ({a}) is offline, empty without its marker, or unreadable "
-                    f"— refusing to sync to avoid deleting real files", None)
-        if not self._side_online(b, map_b):
-            return (f"folder B ({b}) is offline, empty without its marker, or unreadable "
-                    f"— refusing to sync to avoid deleting real files", None)
+        gone) propagates; an *absurd* one (drive offline, partial read, corrupt
+        state) never does."""
+        if not self._side_online(a):
+            return (f"folder A ({a}) is offline or unreadable (the drive may be "
+                    f"disconnected) — refusing to sync to avoid deleting real files", None)
+        if not self._side_online(b):
+            return (f"folder B ({b}) is offline or unreadable (the drive may be "
+                    f"disconnected) — refusing to sync to avoid deleting real files", None)
         if err_a or err_b:
             return (None, "read errors during scan — skipping deletions this pass "
                           "(copies still applied; some files were unreadable)")
@@ -500,9 +470,8 @@ class PairRuntime:
             total = len(all_paths)
 
             # Trust check BEFORE any mutation. We never auto-create a vanished
-            # destination — a missing/empty-without-marker folder means the drive
-            # is OFFLINE, not "the user emptied it", so we refuse rather than
-            # mirror the emptiness back as deletions.
+            # destination — a missing/unreadable folder means the drive is
+            # OFFLINE, so we refuse rather than mirror its emptiness as deletions.
             abort, block_deletes = self._preflight(a, b, map_a, err_a, map_b, err_b)
             if abort:
                 self._log("error", f"Aborting sync: {abort}")
@@ -511,6 +480,18 @@ class PairRuntime:
             if block_deletes:
                 self._log("warn", block_deletes)
             delete_ok = self.cfg.delete_orphans and not block_deletes
+
+            # Non-aborting wipe backstop: if a WHOLE side reads empty while the
+            # other still has files (and we have a baseline), don't propagate that
+            # as a mass-delete — copy/keep instead. Real one-off deletions still
+            # flow through the live watcher; this only shields the periodic scan
+            # from a freak empty read. The sync continues (no error), just no deletes.
+            if delete_ok and self.state.known_count() > 0 and \
+                    ((not map_a and map_b) or (not map_b and map_a)):
+                empty = "A" if not map_a else "B"
+                self._log("warn", f"folder {empty} read as empty while the other has files — "
+                                  f"not propagating deletions this pass (keeping/copying instead).")
+                delete_ok = False
 
             self._progress(f"Comparing {total} files", 40, 0, total)
             copies = dels = skips = errs = 0
@@ -633,11 +614,6 @@ class PairRuntime:
                     errs += 1
                     self._log("error", f"Sync error for {rel}: {e}")
             self.state.save()
-            # Both sides passed the online check above; drop the online-marker so
-            # a future scan can tell "drive online but emptied by user" (marker
-            # present) from "drive offline / not hydrated" (marker gone).
-            self._ensure_sentinel(a)
-            self._ensure_sentinel(b)
             self.cfg.last_sync = datetime.now().isoformat(timespec="seconds")
             self._progress("Done", 100, total, total)
             self._log("info", f"Full sync done — copied: {copies}, deleted: {dels}, skipped: {skips}, errors: {errs}")
