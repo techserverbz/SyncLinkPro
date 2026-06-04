@@ -9,7 +9,7 @@ Monolithic Python sync tool. Combines **Initial Auto Sync**'s battle-tested engi
   - `pairs.json` — all sync pair configs
   - `sync-state/{pair-id}.json` — per-pair mtime/size/origin tracking
 - **Live sync** via watchdog file events with debouncing + echo suppression.
-- **Safety net** — periodic full scan every 5s (two-way) / 30s (one-way) catches anything watchers miss.
+- **Safety net** — periodic full scan every 30s catches anything watchers miss.
 
 ## Run
 
@@ -30,7 +30,7 @@ Or double-click `start.bat`. Opens your browser automatically.
 
 ## What it handles
 
-- Two-way + one-way modes
+- One-way sync (A → B). Folder A is the source of truth; B is a mirror.
 - Manual, auto (real-time), scheduled (cron) triggers
 - File system locks (retry queue with exponential backoff)
 - Watcher echo loops (SuppressSet)

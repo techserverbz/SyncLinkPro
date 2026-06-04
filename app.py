@@ -123,7 +123,7 @@ class PairCreate(BaseModel):
     name: str
     folder_a: str
     folder_b: str
-    mode: str = "twoway"
+    # (two-way sync was removed; one-way A→B is the only mode)
     trigger: str = "auto"
     schedule: Optional[str] = None
     ignore_dirs: list[str] = []
@@ -137,7 +137,7 @@ class PairPatch(BaseModel):
     name: Optional[str] = None
     folder_a: Optional[str] = None
     folder_b: Optional[str] = None
-    mode: Optional[str] = None
+    # (two-way sync was removed; one-way A→B is the only mode)
     trigger: Optional[str] = None
     schedule: Optional[str] = None
     ignore_dirs: Optional[list[str]] = None
@@ -214,7 +214,6 @@ def create_pair(body: PairCreate):
         name=body.name,
         folder_a=str(Path(body.folder_a).expanduser()),
         folder_b=str(Path(body.folder_b).expanduser()),
-        mode=body.mode,
         trigger=body.trigger,
         schedule=body.schedule,
         ignore_dirs=body.ignore_dirs,

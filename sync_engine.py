@@ -4,7 +4,8 @@ Port of Initial Auto Sync's logic with:
   - State files stored in Documents/autosync/state/ (never in source or destination)
   - Callback-based event emission for web UI
   - Pause/resume support
-  - Both one-way and two-way modes under one engine
+  - One-way only (A → B). The previous two-way mode was removed; any legacy
+    "mode" field in existing pairs.json is ignored on load.
 """
 from __future__ import annotations
 import os
@@ -26,10 +27,8 @@ STATE_ROOT = Path(os.path.expanduser("~")) / "Documents" / "autosync" / "state"
 (STATE_ROOT / "sync-state").mkdir(parents=True, exist_ok=True)
 (STATE_ROOT / "logs").mkdir(parents=True, exist_ok=True)
 
-DEBOUNCE_SECONDS = 2.0
-DEBOUNCE_SECONDS_1WAY = 0.5
-SAFETY_SCAN_TWOWAY = 5
-SAFETY_SCAN_ONEWAY = 30
+DEBOUNCE_SECONDS = 0.5            # was DEBOUNCE_SECONDS_1WAY; the only mode now
+SAFETY_SCAN_INTERVAL = 30         # was SAFETY_SCAN_ONEWAY; the only mode now
 DELETE_MAX_RETRIES = 30
 DELETE_INITIAL_DELAY = 2.0
 SUPPRESS_TTL = 5.0
@@ -228,14 +227,15 @@ class SyncPairConfig:
     name: str
     folder_a: str
     folder_b: str
-    mode: str = "twoway"  # twoway | oneway
+    # NOTE: "mode" was removed when two-way sync was retired (one-way A→B only).
+    # Legacy "mode" values in pairs.json are stripped in load_pairs() / update_pair().
     trigger: str = "auto"  # manual | auto | scheduled
     schedule: Optional[str] = None  # cron expression
     ignore_dirs: list = field(default_factory=list)
     ignore_files: list = field(default_factory=list)
     ignore_patterns: list = field(default_factory=list)
     delete_orphans: bool = True
-    safety_scan_interval: Optional[int] = None  # seconds; None = use default (5 for twoway, 30 for oneway)
+    safety_scan_interval: Optional[int] = None  # seconds; None = SAFETY_SCAN_INTERVAL
     paused: bool = False
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     last_sync: Optional[str] = None
@@ -504,44 +504,21 @@ class PairRuntime:
                     in_b = rel in map_b
                     src_path_a = a / rel
                     src_path_b = b / rel
-                    # Handle (empty) directory markers
+                    # Handle (empty) directory markers — one-way: A is source.
                     if rel.endswith("/"):
                         if rel in self._pending_delete:
                             continue
                         actual_rel = rel.rstrip("/")
-                        pa = a / actual_rel
                         pb = b / actual_rel
-                        if self.cfg.mode == "oneway":
-                            if in_a:
-                                if not in_b:
-                                    pb.mkdir(parents=True, exist_ok=True)
-                                    copies += 1
-                                if not self.state.was_known(rel):
-                                    self.state.record(rel, 0, -1, "a")
-                            elif delete_ok:  # in B only → not in source
-                                if self._delete_empty_dir(pb, rel):
-                                    dels += 1
-                            continue
-                        # twoway
-                        if in_a and in_b:
-                            if not self.state.was_known(rel):
-                                self.state.record(rel, 0, -1, "both")
-                        elif in_a:  # in A only
-                            if self.state.was_known(rel) and delete_ok:
-                                if self._delete_empty_dir(pa, rel):
-                                    dels += 1
-                            else:
+                        if in_a:
+                            if not in_b:
                                 pb.mkdir(parents=True, exist_ok=True)
                                 copies += 1
+                            if not self.state.was_known(rel):
                                 self.state.record(rel, 0, -1, "a")
-                        else:  # in B only
-                            if self.state.was_known(rel) and delete_ok:
-                                if self._delete_empty_dir(pb, rel):
-                                    dels += 1
-                            else:
-                                pa.mkdir(parents=True, exist_ok=True)
-                                copies += 1
-                                self.state.record(rel, 0, -1, "b")
+                        elif delete_ok:  # in B only → not in source
+                            if self._delete_empty_dir(pb, rel):
+                                dels += 1
                         continue
 
                     # A delete for this path is in flight (queued retry) — don't
@@ -550,35 +527,15 @@ class PairRuntime:
                         continue
 
                     if in_a and not in_b:
-                        # present only in A
-                        if self.cfg.mode == "twoway":
-                            if self.state.was_known(rel):
-                                # was synced before, now gone from B → delete from A
-                                if delete_ok:
-                                    self._delete(src_path_a, rel)
-                                    dels += 1
-                                    continue
-                            self._copy(src_path_a, src_path_b)
-                            self.state.record(rel, map_a[rel]["mtime"], map_a[rel]["size"], "a")
-                            copies += 1
-                        else:  # oneway: A is source → copy to B
-                            self._copy(src_path_a, src_path_b)
-                            self.state.record(rel, map_a[rel]["mtime"], map_a[rel]["size"], "a")
-                            copies += 1
+                        # present only in A → copy to B (one-way: A is source)
+                        self._copy(src_path_a, src_path_b)
+                        self.state.record(rel, map_a[rel]["mtime"], map_a[rel]["size"], "a")
+                        copies += 1
                     elif in_b and not in_a:
-                        if self.cfg.mode == "twoway":
-                            if self.state.was_known(rel):
-                                if delete_ok:
-                                    self._delete(src_path_b, rel)
-                                    dels += 1
-                                    continue
-                            self._copy(src_path_b, src_path_a)
-                            self.state.record(rel, map_b[rel]["mtime"], map_b[rel]["size"], "b")
-                            copies += 1
-                        else:  # oneway: B is mirror, missing in A → delete from B
-                            if delete_ok:
-                                self._delete(src_path_b, rel)
-                                dels += 1
+                        # present only in B → B is mirror, missing in source → delete B
+                        if delete_ok:
+                            self._delete(src_path_b, rel)
+                            dels += 1
                     else:  # in both — compare
                         ma = map_a[rel]["mtime"]
                         mb = map_b[rel]["mtime"]
@@ -602,13 +559,9 @@ class PairRuntime:
                                 self.state.record(rel, newer_mtime, sa, "both")
                                 skips += 1
                                 continue
-                        # copy newer → older
-                        if self.cfg.mode == "oneway" or ma >= mb:
-                            self._copy(src_path_a, src_path_b)
-                            self.state.record(rel, ma, sa, "a")
-                        else:
-                            self._copy(src_path_b, src_path_a)
-                            self.state.record(rel, mb, sb, "b")
+                        # One-way: A is the source of truth, always overwrite B.
+                        self._copy(src_path_a, src_path_b)
+                        self.state.record(rel, ma, sa, "a")
                         copies += 1
                 except Exception as e:
                     errs += 1
@@ -627,7 +580,7 @@ class PairRuntime:
             self._pending_events[relpath] = (kind, time.time())
 
     def _debounce_loop(self, stop_event):
-        interval = DEBOUNCE_SECONDS if self.cfg.mode == "twoway" else DEBOUNCE_SECONDS_1WAY
+        interval = DEBOUNCE_SECONDS
         while not stop_event.is_set():
             time.sleep(0.25)
             now = time.time()
@@ -656,76 +609,19 @@ class PairRuntime:
             return
         a_exists = src_a.exists()
         b_exists = src_b.exists()
-        if self.cfg.mode == "twoway":
-            # Whichever side exists or is newer wins
-            if not a_exists and not b_exists:
-                if self.state.was_known(rel):
-                    self.state.forget(rel)
-                    self.state.save()
-                return
-            if a_exists and not b_exists:
-                if self.state.was_known(rel) and self.cfg.delete_orphans:
-                    # File gone from B → delete from A only if B is truly online.
-                    if self._live_delete_allowed(b, rel):
-                        self._delete(src_a, rel)
-                else:
-                    self._copy(src_a, src_b)
-                    try:
-                        st = src_a.stat()
-                        self.state.record(rel, st.st_mtime, st.st_size, "a")
-                    except Exception:
-                        pass
-            elif b_exists and not a_exists:
-                if self.state.was_known(rel) and self.cfg.delete_orphans:
-                    # File gone from A → delete from B only if A is truly online.
-                    if self._live_delete_allowed(a, rel):
-                        self._delete(src_b, rel)
-                else:
-                    self._copy(src_b, src_a)
-                    try:
-                        st = src_b.stat()
-                        self.state.record(rel, st.st_mtime, st.st_size, "b")
-                    except Exception:
-                        pass
-            else:
-                try:
-                    sa = src_a.stat()
-                    sb = src_b.stat()
-                    if sa.st_size == sb.st_size and abs(sa.st_mtime - sb.st_mtime) < 1.0:
-                        # Identical — make sure it's recorded as known so a later
-                        # deletion propagates instead of being copied back.
-                        if not self.state.was_known(rel):
-                            self.state.record(rel, sa.st_mtime, sa.st_size, "both")
-                            self.state.save()
-                        return
-                    if sa.st_size == sb.st_size:
-                        ha, hb = md5_of(src_a), md5_of(src_b)
-                        if ha and hb and ha == hb:
-                            if not self.state.was_known(rel):
-                                self.state.record(rel, max(sa.st_mtime, sb.st_mtime), sa.st_size, "both")
-                                self.state.save()
-                            return
-                    if sa.st_mtime >= sb.st_mtime:
-                        self._copy(src_a, src_b)
-                        self.state.record(rel, sa.st_mtime, sa.st_size, "a")
-                    else:
-                        self._copy(src_b, src_a)
-                        self.state.record(rel, sb.st_mtime, sb.st_size, "b")
-                except Exception as e:
-                    self._log("error", f"Compare error {rel}: {e}")
-        else:  # oneway: A → B
-            if a_exists:
-                self._copy(src_a, src_b)
-                try:
-                    st = src_a.stat()
-                    self.state.record(rel, st.st_mtime, st.st_size, "a")
-                except Exception:
-                    pass
-            else:
-                if self.cfg.delete_orphans and b_exists:
-                    # File gone from source A → delete mirror only if A is online.
-                    if self._live_delete_allowed(a, rel):
-                        self._delete(src_b, rel)
+        # One-way only: A is source, B mirrors A.
+        if a_exists:
+            self._copy(src_a, src_b)
+            try:
+                st = src_a.stat()
+                self.state.record(rel, st.st_mtime, st.st_size, "a")
+            except Exception:
+                pass
+        else:
+            if self.cfg.delete_orphans and b_exists:
+                # File gone from source A → delete mirror only if A is online.
+                if self._live_delete_allowed(a, rel):
+                    self._delete(src_b, rel)
         self.state.save()
         self.cfg.last_sync = datetime.now().isoformat(timespec="seconds")
 
@@ -761,8 +657,7 @@ class PairRuntime:
 
     # ---- safety scan ----
     def _safety_scan_loop(self, stop_event):
-        default_interval = SAFETY_SCAN_TWOWAY if self.cfg.mode == "twoway" else SAFETY_SCAN_ONEWAY
-        interval = self.cfg.safety_scan_interval if self.cfg.safety_scan_interval and self.cfg.safety_scan_interval > 0 else default_interval
+        interval = self.cfg.safety_scan_interval if self.cfg.safety_scan_interval and self.cfg.safety_scan_interval > 0 else SAFETY_SCAN_INTERVAL
         while not stop_event.is_set():
             # chunk the sleep so we respond to stop quickly
             for _ in range(interval):
@@ -787,15 +682,14 @@ class PairRuntime:
         self._stop = threading.Event()  # fresh event for this run
         stop_event = self._stop  # capture by closure — old threads kept ref to the OLD (set) event
         self._observer = Observer()
+        # One-way: watch the source (A) only — B is a passive mirror.
         self._observer.schedule(self._make_handler(Path(self.cfg.folder_a)), self.cfg.folder_a, recursive=True)
-        if self.cfg.mode == "twoway":
-            self._observer.schedule(self._make_handler(Path(self.cfg.folder_b)), self.cfg.folder_b, recursive=True)
         self._observer.start()
         self._debounce_thread = threading.Thread(target=self._debounce_loop, args=(stop_event,), daemon=True)
         self._debounce_thread.start()
         self._scan_thread = threading.Thread(target=self._safety_scan_loop, args=(stop_event,), daemon=True)
         self._scan_thread.start()
-        self._log("info", f"Live watcher started ({self.cfg.mode}).")
+        self._log("info", "Live watcher started (one-way A → B).")
 
     def stop(self):
         self._stop.set()
@@ -832,6 +726,10 @@ class Engine:
         try:
             raw = json.loads(PAIRS_FILE.read_text(encoding="utf-8"))
             for cfg_dict in raw:
+                # Migration: 'mode' was removed when two-way was retired.
+                # Strip it so dataclass construction doesn't fail and so any
+                # legacy "twoway" pairs run as one-way going forward.
+                cfg_dict.pop("mode", None)
                 cfg = SyncPairConfig(**cfg_dict)
                 pair = PairRuntime(cfg, self.emit)
                 self.pairs[cfg.id] = pair
@@ -866,6 +764,8 @@ class Engine:
         p.stop()
         cfg_dict = asdict(p.cfg)
         cfg_dict.update(patch)
+        # Migration: ignore any legacy 'mode' key coming from old clients/state.
+        cfg_dict.pop("mode", None)
         new_cfg = SyncPairConfig(**cfg_dict)
         p.cfg = new_cfg
         if new_cfg.trigger == "auto" and not new_cfg.paused:

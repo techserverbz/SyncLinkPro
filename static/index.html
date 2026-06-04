@@ -97,21 +97,13 @@
             <button class="op-btn op-btn-sm" id="pick-b">PICK</button>
           </div>
         </label>
-        <div class="row-2">
-          <label>MODE
-            <select id="f-mode">
-              <option value="twoway">TWO-WAY</option>
-              <option value="oneway">ONE-WAY (A → B)</option>
-            </select>
-          </label>
-          <label>TRIGGER
-            <select id="f-trigger">
-              <option value="auto">AUTO (LIVE)</option>
-              <option value="manual">MANUAL</option>
-              <option value="scheduled">SCHEDULED</option>
-            </select>
-          </label>
-        </div>
+        <label>TRIGGER
+          <select id="f-trigger">
+            <option value="auto">AUTO (LIVE)</option>
+            <option value="manual">MANUAL</option>
+            <option value="scheduled">SCHEDULED</option>
+          </select>
+        </label>
         <label id="schedule-label" class="hidden">CRON
           <input id="f-schedule" type="text" placeholder="*/15 * * * *" />
           <small class="hint">Presets: <a href="#" data-cron="*/5 * * * *">5m</a> · <a href="#" data-cron="*/15 * * * *">15m</a> · <a href="#" data-cron="0 * * * *">hourly</a> · <a href="#" data-cron="0 9 * * 1-5">weekdays 9am</a></small>
@@ -122,8 +114,8 @@
         <label>IGNORE PATTERNS <small class="hint">comma-separated, glob-style</small>
           <input id="f-ipat" type="text" placeholder="*.log, *.tmp" />
         </label>
-        <label>SAFETY SCAN INTERVAL <small class="hint">seconds — how often to do a full-folder check. Empty = default (5s two-way, 30s one-way)</small>
-          <input id="f-safety" type="number" min="1" placeholder="5" />
+        <label>SAFETY SCAN INTERVAL <small class="hint">seconds — how often to do a full-folder check. Empty = default (30s)</small>
+          <input id="f-safety" type="number" min="1" placeholder="30" />
         </label>
         <label class="checkbox">
           <input id="f-orphans" type="checkbox" checked disabled />

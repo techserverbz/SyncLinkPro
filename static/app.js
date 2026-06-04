@@ -32,7 +32,7 @@ function renderSidebar() {
     li.innerHTML = `
       <span class="dot ${dotClass}"></span>
       <span class="pair-name">${escape(p.name)}</span>
-      <span class="pair-mode">${p.mode === "twoway" ? "2W" : "1W"}</span>
+      <span class="pair-mode">1W</span>
     `;
     li.onclick = () => selectPair(p.id);
     list.appendChild(li);
@@ -51,7 +51,7 @@ function renderDetail() {
   chip.className = "status-chip " + status;
   $("#d-a").textContent = p.folder_a;
   $("#d-b").textContent = p.folder_b;
-  $("#d-mode").textContent = p.mode === "twoway" ? "TWO-WAY ↔" : "ONE-WAY →";
+  $("#d-mode").textContent = "ONE-WAY →";
   $("#d-trigger").textContent = p.trigger.toUpperCase() + (p.schedule ? ` (${p.schedule})` : "");
   $("#d-orphans").textContent = p.delete_orphans ? "YES" : "NO";
   $("#d-last").textContent = p.last_sync || "Never";
@@ -171,7 +171,6 @@ function openModal(pair = null) {
   $("#f-name").value = pair?.name || "";
   $("#f-a").value = pair?.folder_a || "";
   $("#f-b").value = pair?.folder_b || "";
-  $("#f-mode").value = pair?.mode || "twoway";
   $("#f-trigger").value = pair?.trigger || "auto";
   $("#f-schedule").value = pair?.schedule || "";
   $("#f-idirs").value = pair ? (pair.ignore_dirs || []).join(", ") : DEFAULT_IGNORE_DIRS.join(", ");
@@ -196,7 +195,6 @@ async function saveModal() {
     name: $("#f-name").value.trim(),
     folder_a: $("#f-a").value.trim(),
     folder_b: $("#f-b").value.trim(),
-    mode: $("#f-mode").value,
     trigger: $("#f-trigger").value,
     schedule: $("#f-trigger").value === "scheduled" ? $("#f-schedule").value.trim() || null : null,
     ignore_dirs: split($("#f-idirs").value),
