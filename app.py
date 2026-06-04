@@ -74,8 +74,12 @@ class Broadcaster:
             self.clients.discard(d)
 
     def push(self, pair_id: str, level: str, message: str, extra: dict):
-        # Called from sync-engine threads → must schedule onto asyncio loop
-        self.append_log(pair_id, level, message, extra)
+        # Called from sync-engine threads → must schedule onto asyncio loop.
+        # progress + status are transient UI state, not history — don't store
+        # them in the per-pair log buffer (otherwise the GET /logs endpoint
+        # replays them as a fake "PROGRESS"/"STATUS" log line on refresh).
+        if level not in ("progress", "status"):
+            self.append_log(pair_id, level, message, extra)
         payload = {"pair_id": pair_id, "level": level, "message": message, **extra}
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(self._send_all(payload), self._loop)

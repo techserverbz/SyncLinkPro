@@ -77,6 +77,9 @@ function renderLogs(logs) {
   const ul = $("#logs");
   ul.innerHTML = "";
   for (const log of logs) {
+    // progress/status are transient UI state, never history. Skip defensively
+    // in case any old entries are still in the buffer.
+    if (log.level === "progress" || log.level === "status") continue;
     if (currentFilter !== "all" && log.level !== currentFilter) continue;
     const li = document.createElement("li");
     li.className = "log";
@@ -100,6 +103,17 @@ async function selectPair(id) {
   activePairId = id;
   renderSidebar();
   renderDetail();
+  // If a sync is already in flight when we land on this pair, surface the bar
+  // immediately with whatever progress we've cached from WS events instead of
+  // waiting for the next progress tick.
+  const p = pairs.find(x => x.id === id);
+  if (p && p.status === "syncing") {
+    showProgress();
+    const cached = pairProgress[id];
+    if (cached) updateProgress(cached.phase, cached.percent);
+  } else {
+    hideProgress();
+  }
   const logs = await api.logs(id);
   renderLogs(logs);
 }
@@ -109,6 +123,16 @@ async function refreshAll() {
   renderSidebar();
   renderDetail();
   if (activePairId) {
+    // Same in-flight-sync handling as selectPair — page reload during a sync
+    // should still show the bar.
+    const p = pairs.find(x => x.id === activePairId);
+    if (p && p.status === "syncing") {
+      showProgress();
+      const cached = pairProgress[activePairId];
+      if (cached) updateProgress(cached.phase, cached.percent);
+    } else {
+      hideProgress();
+    }
     const logs = await api.logs(activePairId);
     renderLogs(logs);
   }
