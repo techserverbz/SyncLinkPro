@@ -351,30 +351,89 @@ def on_shutdown():
     scheduler.shutdown(wait=False)
 
 
-def kill_existing_port(port: int):
-    """Kill any process already using this port."""
+def _pid_cmdline(pid: str) -> str:
+    """Return the lowercased command-line of a PID, or '' if it can't be read.
+
+    Tries PowerShell's Get-CimInstance first (works on every modern Windows),
+    falls back to WMIC for older boxes. Both are read-only — no side effects.
+    """
     import subprocess
     try:
-        result = subprocess.run(
-            ["netstat", "-ano"], capture_output=True, text=True
+        ps = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"],
+            capture_output=True, text=True, timeout=4
         )
+        out = (ps.stdout or "").strip()
+        if out:
+            return out.lower()
+    except Exception:
+        pass
+    try:
+        wmic = subprocess.run(
+            ["wmic", "process", "where", f"ProcessId={pid}", "get", "CommandLine", "/value"],
+            capture_output=True, text=True, timeout=4
+        )
+        return (wmic.stdout or "").lower()
+    except Exception:
+        return ""
+
+
+def stop_stale_synclinkpro(port: int):
+    """If a stale SyncLinkPro (python running app.py) is on this port, kill
+    ONLY it. Anything else is left alone.
+
+    Safety logic: SyncLinkPro's port is read from .env via dotenv_values()
+    above — never from os.environ — so Christopher's PORT=7777 can't sneak
+    in here. That means whatever is on `port` is either us or an unrelated
+    process. We only kill when the process is python AND its command line
+    references `app.py` (matches `python app.py`, `python.exe app.py`, full
+    paths to either, and Uvicorn reload's child workers)."""
+    import subprocess
+    try:
+        result = subprocess.run(["netstat", "-ano"], capture_output=True, text=True)
         for line in result.stdout.splitlines():
-            if f":{port}" in line and "LISTENING" in line:
-                pid = line.strip().split()[-1]
+            if f":{port}" not in line or "LISTENING" not in line:
+                continue
+            pid = line.strip().split()[-1]
+            cmdline = _pid_cmdline(pid)
+            is_python = "python" in cmdline
+            is_app_py = "app.py" in cmdline
+            if is_python and is_app_py:
                 subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True)
-                print(f"  Killed existing process on port {port} (PID {pid})")
+                print(f"  Stopped stale SyncLinkPro on port {port} (PID {pid})")
+                # Give Windows a moment to release the socket — otherwise the
+                # very next bind hits TIME_WAIT and we get WinError 10048.
+                import time
+                for _ in range(20):
+                    time.sleep(0.25)
+                    probe = subprocess.run(["netstat", "-ano"], capture_output=True, text=True)
+                    if not any(f":{port}" in ln and "LISTENING" in ln for ln in probe.stdout.splitlines()):
+                        break
+            else:
+                print(f"  Port {port} is held by PID {pid} (not SyncLinkPro). Leaving it alone.")
     except Exception:
         pass
 
 
 if __name__ == "__main__":
-    import os
-    from dotenv import load_dotenv
-    load_dotenv()
-    port = int(os.getenv("PORT", 7878))
-    kill_existing_port(port)
+    import os, sys
+    from dotenv import dotenv_values
+    # Read PORT ONLY from .env (or fall back to the hardcoded default 7878).
+    # We never read os.environ["PORT"] because Christopher exports PORT=7777
+    # in some shells; if SyncLinkPro picked that up it would try to bind 7777
+    # and (before this fix) kill Christopher's process. dotenv_values returns
+    # purely what's parsed from the .env file — os.environ is ignored.
+    env_file = dotenv_values(".env")
+    port = int(env_file.get("PORT") or 7878)
+    stop_stale_synclinkpro(port)
     url = f"http://localhost:{port}"
-    print(f"\n  SyncLinkPro  →  {url}\n")
+    # Plain ASCII so Windows cp1252 console doesn't crash on the arrow.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+    print(f"\n  SyncLinkPro  ->  {url}\n")
     try:
         webbrowser.open(url)
     except Exception:
